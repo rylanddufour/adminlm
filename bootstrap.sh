@@ -15,6 +15,43 @@
 set -e
 
 # ============================================
+# Version Sentinel — refuse auto-upgrade across versions.
+#
+# The shipped VERSION file lives in the same directory as this script.
+# A customer's previously-installed version lives at $INSTALL_BASE_DIR/adminlm/VERSION.
+# Mismatch ⇒ print upgrade instructions and exit 0 (be safe, do nothing).
+# To force an upgrade, the customer (or Ryland via SSH) does:
+#     rm ~/adminlm/VERSION && cd ~/adminlm && git pull && bash bootstrap.sh
+# Or to skip migration safety, edit ~/adminlm/VERSION to match the new shipped version.
+# ============================================
+
+SHIPPED_VERSION="$(cat "$(dirname "${BASH_SOURCE[0]:-$0}")/VERSION" 2>/dev/null || echo "")"
+INSTALLED_VERSION_FILE="$INSTALL_BASE_DIR/adminlm/VERSION"
+
+if [[ -n "$SHIPPED_VERSION" && -f "$INSTALLED_VERSION_FILE" ]]; then
+    INSTALLED_VERSION="$(cat "$INSTALLED_VERSION_FILE" 2>/dev/null || echo "")"
+    if [[ "$INSTALLED_VERSION" != "$SHIPPED_VERSION" ]]; then
+        echo "============================================"
+        echo "  AdminLM VERSION MISMATCH — bootstrap halted"
+        echo "============================================"
+        echo ""
+        echo "  Installed version:  $INSTALLED_VERSION"
+        echo "  Shipped version:    $SHIPPED_VERSION"
+        echo ""
+        echo "  Bootstrap does NOT auto-upgrade across versions."
+        echo "  To upgrade, run ONE of:"
+        echo ""
+        echo "    # Full upgrade (recommended; runs migrations):"
+        echo "    rm $INSTALLED_VERSION_FILE && cd $INSTALL_BASE_DIR/adminlm && git pull && bash bootstrap.sh"
+        echo ""
+        echo "    # Skip migration safety (advanced; ONLY if you know what's changing):"
+        echo "    echo $SHIPPED_VERSION > $INSTALLED_VERSION_FILE && bash bootstrap.sh"
+        echo ""
+        exit 0
+    fi
+fi
+
+# ============================================
 # Configuration
 # ============================================
 
@@ -2879,6 +2916,14 @@ main() {
 
     # Print customer-facing access summary (URLs, credentials, ports, hints)
     print_access_summary
+
+    # Write VERSION sentinel so the next bootstrap run can detect installed-vs-shipped mismatch.
+    # Only writes when this script was invoked from a checkout that carries a VERSION file
+    # (SHIPPED_VERSION is non-empty, set in the top-of-file sentinel block).
+    if [[ -n "$SHIPPED_VERSION" ]]; then
+        echo "$SHIPPED_VERSION" > "$INSTALLED_VERSION_FILE"
+        log_success "Wrote AdminLM $SHIPPED_VERSION to $INSTALLED_VERSION_FILE"
+    fi
 
     # Customer-facing post-install print (Streamlit URL, creds reminder,
     # flow TL;DR, Loki labels). Called after print_access_summary so the

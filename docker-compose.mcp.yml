@@ -15,7 +15,7 @@
 services:
   # Grafana MCP server — multi-client HTTP transport on port 8000
   grafana-mcp:
-    image: grafana/mcp-grafana:latest
+    image: grafana/mcp-grafana:0.5.0
     container_name: grafana-mcp
     ports:
       - "0.0.0.0:8000:8000"

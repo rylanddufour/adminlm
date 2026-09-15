@@ -43,7 +43,7 @@ services:
 
   # Metrics + Log Collection Agent
   alloy:
-    image: grafana/alloy:latest
+    image: grafana/alloy:v1.5.1
     container_name: alloy
     # Pin the container's hostname to "adminlm-host" so that alloy's
     # `sys.env("HOSTNAME")` (used in the `self_host` relabel) returns the
@@ -85,7 +85,7 @@ services:
   # Customer hosts now push metrics + logs via Grafana Alloy to Prom :9090
   # and Loki :3100 directly. See docs/multi-host-monitoring.md.
   promtail:
-    image: grafana/promtail:latest
+    image: grafana/promtail:3.5.2
     container_name: promtail
     ports:
       # Network devices: TCP + UDP. Many switches/APs/firewalls default to UDP syslog.
@@ -111,7 +111,7 @@ services:
   # `host="adminlm-host"`). For real customer Docker installs, drop this
   # override and let Docker resolve from the OS hostname.
   alloy-customer:
-    image: grafana/alloy:latest
+    image: grafana/alloy:v1.5.1
     container_name: alloy-customer
     hostname: adminlm-host
     ports:
@@ -166,7 +166,7 @@ services:
   # network_mode: host so probes can hit localhost endpoints
   # (Grafana, Loki, Prometheus, Alloy, Hermes Dashboard, MCP servers, Promtail syslog)
   blackbox_exporter:
-    image: prom/blackbox-exporter:latest
+    image: prom/blackbox-exporter:v0.25.0
     container_name: blackbox_exporter
     network_mode: host
     cap_add:
