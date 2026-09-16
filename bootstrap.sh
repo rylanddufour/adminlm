@@ -563,6 +563,73 @@ clone_infra_repo() {
 }
 
 # ============================================
+# Substitute host-specific values in the infra repo
+# ============================================
+# config/prometheus.yml hard-codes 192.168.0.220:9115 as the blackbox_exporter
+# scrape target on the canonical AdminLM .220 deployment. On any other host
+# this points Prometheus at the wrong machine and every blackbox-* target
+# goes DOWN (probe_success rows empty → health dashboard panels red). Fix:
+# detect the host's primary external IP at install time and substitute it
+# into all `192.168.0.220:9115` occurrences. Idempotent — safe on re-run
+# (uses a sentinel comment to skip the substitution when already done).
+
+substitute_host_ip() {
+    local infra_dir="${INFRA_DIR:?INFRA_DIR not set — main() must clone repo first}"
+    local prom_yml="$infra_dir/config/prometheus.yml"
+
+    if [ ! -f "$prom_yml" ]; then
+        log_warn "prometheus.yml not found at $prom_yml; skipping host IP substitution"
+        return 0
+    fi
+
+    # Sentinel: a `# host-substituted: <ip>` marker comment written after a
+    # successful substitution. On re-run we detect it and skip (idempotent).
+    # The sentinel lives in a comment block so it never affects Prometheus's
+    # YAML parser.
+    if grep -q '^# host-substituted:' "$prom_yml"; then
+        local existing_ip
+        existing_ip="$(grep '^# host-substituted:' "$prom_yml" | head -1 | awk '{print $2}')"
+        log_info "prometheus.yml already host-substituted (host=$existing_ip); skipping"
+        return 0
+    fi
+
+    # Detect the host's primary external IP via the default route's src.
+    # This is the IP a remote Prometheus (or remote blackbox target) would
+    # dial to reach this host — matches what curl / wget from another box
+    # would see. Falls back to hostname -I if `ip route get` is unavailable.
+    local host_ip
+    host_ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ {print $7; exit}')"
+    if [ -z "$host_ip" ]; then
+        host_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    fi
+    if [ -z "$host_ip" ]; then
+        log_warn "Could not detect host external IP; prometheus.yml will keep the canonical .220 address and blackbox probes will be DOWN until fixed manually"
+        return 0
+    fi
+
+    local count
+    count="$(grep -c '192.168.0.220:9115' "$prom_yml" || true)"
+    if [ "$count" = "0" ]; then
+        log_info "No 192.168.0.220:9115 references in prometheus.yml; nothing to substitute (host_ip=$host_ip)"
+        # Still write the sentinel so future re-runs skip cleanly
+        sed -i "1i # host-substituted: $host_ip" "$prom_yml"
+        return 0
+    fi
+
+    # Substitute in place. The 192.168.0.220:9115 literal appears in:
+    #   - relabel_configs[].replacement (5 sites: blackbox, blackbox_mcp,
+    #     blackbox_login, blackbox_tcp, blackbox_inventory)
+    #   - blackbox_exporter static_configs.targets (1 site)
+    # sed -i handles all six atomically.
+    sed -i "s|192.168.0.220:9115|${host_ip}:9115|g" "$prom_yml"
+
+    # Sentinel comment at the top so re-runs skip.
+    sed -i "1i # host-substituted: $host_ip" "$prom_yml"
+
+    log_success "Substituted $count 192.168.0.220:9115 references in prometheus.yml → ${host_ip}:9115"
+}
+
+# ============================================
 # Configure Hermes with API Key
 # ============================================
 
@@ -2825,6 +2892,13 @@ main() {
     # directly rather than re-calling clone_infra_repo().
     INFRA_DIR="$(clone_infra_repo)"
     export INFRA_DIR
+
+    # Substitute host-specific values in the cloned repo (e.g. host IP in
+    # prometheus.yml blackbox scrape targets) BEFORE auto_deploy_stack. Must
+    # run after clone_infra_repo (needs $INFRA_DIR) and before any docker
+    # compose up that reads the file (Prometheus is bind-mounted from
+    # $INFRA_DIR/config/prometheus.yml).
+    substitute_host_ip
 
     configure_hermes_api
     provision_api_server_key
