@@ -190,12 +190,12 @@ def hermes_profile() -> str:
 # Low-level HTTP
 # ---------------------------------------------------------------------------
 
-# Reasonable timeouts: the API is on the same Docker network (or
-# host.docker.internal), so connect should be ~ms. Read needs to cover a
-# full response from /v1/responses including any tool calls the agent
-# makes — 60s is generous for v1.0 and short enough that a stuck agent
-# surfaces as a clear error rather than a hung Streamlit page.
-_DEFAULT_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=30.0, pool=10.0)
+# Default HTTP timeouts for non-streaming helpers (start_chat/continue_chat).
+# Streaming helpers use the same values internally. Cron-job agents and
+# other long-running tool sequences can take well over a minute; the
+# previous 60s read cap made any agent turn running >1 cron job look like
+# a hang. 300s read / 120s write is generous for v1.x.
+_DEFAULT_TIMEOUT = httpx.Timeout(connect=10.0, read=300.0, write=120.0, pool=10.0)
 
 
 def _hermes_request(
@@ -308,11 +308,50 @@ def _extract_text_and_tools(output: list[dict]) -> tuple[str, list[dict]]:
 
 
 # ---------------------------------------------------------------------------
-# Chat methods
-# ---------------------------------------------------------------------------
+# Chat methods (streaming + non-streaming)
+# -----------------------------------------------------------------------------
+
+
+def _iter_sse_events(response: httpx.Response):
+    """Yield parsed SSE event dicts from an httpx streaming response.
+
+    The gateway emits OpenAI Responses-API SSE events:
+        event: response.created
+        data: {"type": "response.created", ...}
+
+    Empty lines separate events; comment lines start with ':'. We ignore
+    comments and the 'event:' line (we read the type from `data`).
+
+    Yields:
+        dict (the parsed JSON `data` payload) per event.
+
+    Raises:
+        httpx.RequestError: network / timeout / etc.
+        json.JSONDecodeError: a non-JSON data line slipped through.
+    """
+    for line in response.iter_lines():
+        if not line:
+            continue
+        if line.startswith(":"):
+            continue
+        # Strip the "event: " / "data: " prefix and any \r
+        if line.startswith("data:"):
+            payload = line[len("data:"):].lstrip()
+        else:
+            # OpenAI Responses API streams also use 'event:' lines; ignore them
+            continue
+        if payload.strip() == "[DONE]":
+            return
+        yield json.loads(payload)
+
 
 def start_chat(user: str, first_message: str) -> dict:
     """Start a new IT_ADMIN chat session.
+
+    Non-streaming convenience wrapper around start_chat_streaming(). Collects
+    the full SSE event stream and returns the same shape as before — keeps
+    Card 5 / BACKLOG #64's external API stable. New UI work uses
+    start_chat_streaming() directly to show live progress.
 
     Args:
         user: username (for audit logging only — body does NOT include it;
@@ -332,40 +371,72 @@ def start_chat(user: str, first_message: str) -> dict:
     Raises:
         HermesAuthError, HermesAPIError, httpx.RequestError.
     """
-    r = _hermes_request(
-        "POST", "v1/responses",
-        json_body={
-            "model": hermes_model(),
-            "input": first_message,
-            "stream": False,
-        },
-    )
-    _raise_for_status(r)
-    body = r.json()
-    session_id = r.headers.get("X-Hermes-Session-Id", "").strip()
-    response_id = body.get("id", "")
-    text, tool_calls = _extract_text_and_tools(body.get("output", []))
+    session_id = ""
+    response_id = ""
+    final_output: list[dict] = []
+    usage: dict = {}
+    body_for_exc: dict = {}
+    try:
+        for event, hdr_session_id in start_chat_streaming(user, first_message):
+            t = event.get("type")
+            if t == "response.created":
+                response_id = event.get("response", {}).get("id", "") or response_id
+            elif t == "response.completed":
+                resp = event.get("response", {}) or {}
+                response_id = resp.get("id", "") or response_id
+                final_output = resp.get("output", []) or []
+                usage = resp.get("usage", {}) or {}
+            if hdr_session_id:
+                session_id = hdr_session_id
+        # If we didn't get a completed event, fall back to whatever we collected
+        if not final_output and body_for_exc:
+            final_output = body_for_exc.get("output", []) or []
+            usage = body_for_exc.get("usage", {}) or {}
+    except httpx.HTTPError:
+        # Re-raise — callers handle auth/api/network distinctly
+        raise
+    text, tool_calls = _extract_text_and_tools(final_output)
     if not session_id or not response_id:
-        # Defensive: Card 1's probe always returned both. If either is
-        # missing the conversation is unusable — surface a clear error.
         raise HermesAPIError(
             200,
             f"Missing session/response id: session_id={session_id!r} "
-            f"response_id={response_id!r} body={json.dumps(body)[:500]}",
-            str(r.url),
+            f"response_id={response_id!r}",
+            "<streaming>",
         )
     return {
         "session_id": session_id,
         "response_id": response_id,
         "text": text,
         "tool_calls": tool_calls,
-        "usage": body.get("usage", {}),
-        "raw": body,
+        "usage": usage,
+        "raw": {"output": final_output, "usage": usage},
     }
+
+
+def start_chat_streaming(user: str, first_message: str):
+    """Stream a new chat turn as SSE events.
+
+    Yields:
+        (event_dict, session_id_str) tuples. session_id_str is the value of
+        the X-Hermes-Session-Id header from the first chunk (empty until
+        the first event is received). event_dict is the parsed `data`
+        payload of each SSE event.
+
+    Raises:
+        HermesAuthError: HERMES_API_KEY unset.
+        HermesAPIError: gateway returned non-2xx on the first chunk.
+        httpx.RequestError: network / timeout.
+    """
+    body = {"model": hermes_model(), "input": first_message, "stream": True}
+    yield from _stream_chat_turn(body)
 
 
 def continue_chat(session_id: str, message: str, previous_response_id: str) -> dict:
     """Continue an existing chat session.
+
+    Non-streaming wrapper around continue_chat_streaming(). Same return
+    shape as start_chat(). See start_chat()'s docstring + the
+    IMPORTANT note about session_id vs previous_response_id below.
 
     IMPORTANT: Hermes chaining uses `previous_response_id` (per-turn
     response handle), NOT `conversation_id` or `session_id`. The
@@ -373,45 +444,137 @@ def continue_chat(session_id: str, message: str, previous_response_id: str) -> d
     UUID — useful for `delete_session` but NOT for chaining the next
     turn. Callers must persist `response_id` (the per-turn handle)
     alongside the session_id in their DB and pass it back here.
-
-    Args:
-        session_id: the X-Hermes-Session-Id UUID from start_chat (logged
-            for debugging; not used in the request body).
-        message: the user's next prompt.
-        previous_response_id: the `resp_...` from the prior turn.
-
-    Returns:
-        Same shape as start_chat.
     """
     if not previous_response_id:
-        # Defensive — without this, the gateway treats the call as a new
-        # conversation and the "assistant remembers" assertion fails.
         raise HermesAPIError(
             0,
             "continue_chat requires previous_response_id (the resp_... from "
             "the prior turn). Got empty string.",
             "continue_chat",
         )
-    r = _hermes_request(
-        "POST", "v1/responses",
-        json_body={
-            "model": hermes_model(),
-            "input": message,
-            "stream": False,
-            "previous_response_id": previous_response_id,
-        },
-    )
-    _raise_for_status(r)
-    body = r.json()
-    text, tool_calls = _extract_text_and_tools(body.get("output", []))
+    session_id = ""
+    response_id = ""
+    final_output: list[dict] = []
+    usage: dict = {}
+    try:
+        for event, hdr_session_id in continue_chat_streaming(
+            session_id, message, previous_response_id
+        ):
+            t = event.get("type")
+            if t == "response.created":
+                response_id = event.get("response", {}).get("id", "") or response_id
+            elif t == "response.completed":
+                resp = event.get("response", {}) or {}
+                response_id = resp.get("id", "") or response_id
+                final_output = resp.get("output", []) or []
+                usage = resp.get("usage", {}) or {}
+            if hdr_session_id:
+                session_id = hdr_session_id
+    except httpx.HTTPError:
+        raise
+    text, tool_calls = _extract_text_and_tools(final_output)
     return {
-        "session_id": session_id,
-        "response_id": body.get("id", ""),
+        "session_id": session_id or session_id,  # echo the caller's value
+        "response_id": response_id,
         "text": text,
         "tool_calls": tool_calls,
-        "usage": body.get("usage", {}),
-        "raw": body,
+        "usage": usage,
+        "raw": {"output": final_output, "usage": usage},
     }
+
+
+def continue_chat_streaming(
+    session_id: str, message: str, previous_response_id: str,
+):
+    """Stream a continuing chat turn as SSE events.
+
+    See start_chat_streaming() for the yield shape. session_id argument
+    here is the X-Hermes-Session-Id UUID — echoed back for logging.
+    previous_response_id is the per-turn `resp_...` handle that chains
+    the conversation.
+    """
+    body = {
+        "model": hermes_model(),
+        "input": message,
+        "stream": True,
+        "previous_response_id": previous_response_id,
+    }
+    yield from _stream_chat_turn(body)
+
+
+def _stream_chat_turn(json_body: dict):
+    """Internal chokepoint that opens the streaming request + iterates SSE.
+
+    Yields (event_dict, session_id_str) tuples. On a non-2xx response
+    (caught from the first byte of the stream) raises HermesAPIError so
+    the UI can show a status code.
+
+    The X-Hermes-Session-Id header is captured on the response and
+    re-yielded on every event so callers always know the session id
+    (without having to track it across events themselves).
+    """
+    # Same URL-resolution logic as _hermes_request(). We deliberately
+    # don't share via a helper because streaming needs `client.stream()`
+    # (which doesn't have a request() equivalent) and we want the
+    # session_id header available on the first event.
+    key = hermes_api_key()
+    if not key:
+        raise HermesAuthError(
+            "HERMES_API_KEY is not set in the streamlit-ui container env. "
+            "Set it in docker-compose.yml (or .env) and rebuild."
+        )
+    base = hermes_api_base_url().rstrip("/")
+    if base.endswith("/v1"):
+        url = f"{base}/responses"
+    else:
+        url = f"{base}/v1/responses"
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+        "X-Hermes-Profile": hermes_profile(),
+    }
+    session_id = ""
+    # Use a streaming client so we don't buffer the full body.
+    # Read/write timeouts: connect=10s (local Docker network), read=300s
+    # (cron-job agents can take minutes), write=120s, pool=10s. Same as
+    # _DEFAULT_TIMEOUT below.
+    timeout = httpx.Timeout(connect=10.0, read=300.0, write=120.0, pool=10.0)
+    with httpx.Client(timeout=timeout) as client:
+        with client.stream("POST", url, headers=headers, json=json_body) as r:
+            # Capture session id from the response headers (set by the
+            # gateway on the first chunk of every turn).
+            session_id = r.headers.get("X-Hermes-Session-Id", "").strip()
+            if r.status_code >= 400:
+                # Drain a small amount of the body for the error message
+                # then raise. Streaming responses don't have r.text.
+                snippet = b""
+                try:
+                    for chunk in r.iter_bytes(chunk_size=4096):
+                        snippet += chunk
+                        if len(snippet) > 4096:
+                            break
+                except Exception:
+                    pass
+                if r.status_code in (401, 403):
+                    raise HermesAuthError(
+                        f"Hermes auth failed: {r.status_code} {snippet[:200].decode(errors='replace')}"
+                    )
+                raise HermesAPIError(
+                    r.status_code,
+                    snippet[:2000].decode(errors="replace"),
+                    str(r.url),
+                )
+            for event in _iter_sse_events(r):
+                yield event, session_id
+
+
+# Update _DEFAULT_TIMEOUT so the non-streaming helpers (still used by
+# tests and any caller that wants the full body in one shot) also have
+# the same generous read window. Cron-job agents and other long-running
+# tool sequences can take well over a minute; the previous 60s cap made
+# any agent turn running >1 cron job look like a hang.
+# (Definition lives at the top of the file alongside _hermes_request.)
 
 
 def list_sessions(user_id: int | None = None) -> list[dict]:
