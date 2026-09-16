@@ -6,7 +6,32 @@ Self-hosting infrastructure platform using Hermes Agent.
 
 - Ubuntu Server (24.04 recommended)
 - User with **sudo privileges** (Hermes runs as this user)
+- **Passwordless sudo** for that user — required. The docs-site Hermes installer
+  inside `bootstrap.sh` runs `sudo` non-interactively many times (apt installs,
+  Docker install, hermes-gateway.service enable, dashboard systemd unit). If
+  sudo prompts for a password and stdin is closed (the usual `curl | bash`
+  invocation), those `sudo` calls fail silently and downstream steps (Hermes
+  Agent install + the Hermes-managed Node 22 binary that the Dashboard Vite
+  build depends on) never complete. See `### "Web UI build failed; dashboard
+  will not start"` below for the symptom this produces.
 - Internet connectivity for downloading images
+
+### Configuring passwordless sudo
+
+```bash
+# As root (or a sudo-capable user), give the install user passwordless sudo.
+# Replace 'youruser' with the account that will run bootstrap.sh.
+echo "youruser ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/90-adminlm-install
+sudo chmod 440 /etc/sudoers.d/90-adminlm-install
+
+# Verify it works without a password prompt
+sudo -n true && echo "OK — passwordless sudo is working" || echo "FAIL — see above"
+```
+
+> **Why not just keep passwordless sudo in `/etc/sudoers`?** Use a drop-in
+> file under `/etc/sudoers.d/` (mode 0440) — it's the standard pattern, easy
+> to remove cleanly after install, and won't be clobbered by future
+> `/etc/sudoers` edits.
 
 ## Deployment Process
 
@@ -195,6 +220,51 @@ sudo ufw status
 - **Skill safety gates** (PR #8, BACKLOG #22) — `skills.write_approval: true` (writes staged for review) + `skills.guard_agent_created: true` (scans for malicious patterns)
 
 ## Troubleshooting
+
+### "Web UI build failed; dashboard will not start"
+
+This message is misleading — the Vite build itself is fine. The real cause
+is almost always **the docs-site Hermes installer inside `bootstrap.sh`
+couldn't run `sudo` non-interactively**, so the Hermes-managed Node binary
+never landed at `$HOME/.hermes/node/bin/`. Without that Node, `npm install`
+falls back to the system Node (usually Ubuntu 24.04's Node 20), which is
+rejected by `web/package.json`'s `engines` constraint:
+
+```
+npm error code EBADENGINE
+npm error Not compatible with your version of node/npm
+npm error Required: {"node":"^22.22.0 || ^24.11.0 || >=26.0.0", ...}
+npm error Actual:   {"node":"v20.x.x", ...}
+```
+
+The build then fails and `bootstrap.sh` reports "Web UI build failed" — but
+the real fix is to give the install user passwordless sudo (see
+[Prerequisites](#prerequisites)) and re-run bootstrap.sh.
+
+**Verify on the affected host:**
+
+```bash
+# 1. Was Hermes-managed Node installed?
+ls -la ~/.hermes/node/bin/node
+# If missing → sudo was blocking the docs-site installer.
+
+# 2. Can sudo run non-interactively?
+sudo -n true && echo "OK" || echo "FAIL"
+# If FAIL → fix sudoers (see Prerequisites above), then re-run bootstrap.sh.
+
+# 3. Confirm the build works once the right Node is on PATH:
+export PATH="$HOME/.hermes/node/bin:$HOME/.hermes/.local/bin:$PATH"
+cd ~/.hermes/hermes-agent/web
+npm install && npm run build
+```
+
+Re-run bootstrap.sh after fixing sudo:
+
+```bash
+cd ~/adminlm && git pull && bash bootstrap.sh
+```
+
+(The build is idempotent — it's safe to re-run end-to-end.)
 
 ### Check container status
 ```bash
