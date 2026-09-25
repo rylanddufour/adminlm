@@ -175,7 +175,353 @@ else:
 # chat_input is the ONE widget on this page. It clears itself and
 # triggers a script rerun on every submit. That natural cycle is what
 # makes "stay on the same page" work.
-prompt = st.chat_input("Ask IT_ADMIN…")
+#
+# BACKLOG #97 — Agent Chat approval UX.
+# When a chat turn parks waiting for human approval (e.g. IT_ADMIN hits
+# a tool that requires a destructive-command approval per
+# change-management / non-destructive-operations skills), the page enters
+# a multi-rerun state machine driven by `_pending_run_approval` in
+# session_state. While pending, chat_input is disabled (a normal chat
+# submit would go nowhere — the agent thread is parked at the tool layer).
+#
+# State machine (each row = one Streamlit script run):
+#   1. chat_input submitted → chat SSE consumer returns → response_id known
+#      → get_run_status() == waiting_for_approval
+#      → save {"response_id", "text_so_far", "tool_calls"} to
+#        st.session_state["_pending_run_approval"] → st.rerun()
+#   2. rerun enters the approval-wait branch below:
+#      → connect iter_run_events(); block until approval.request arrives
+#      → render warning + button row inside st.chat_message("assistant")
+#        with on_click callbacks that call submit_run_approval() and
+#        add the resolved request_id to _pending_run_approval["resolved"]
+#      → callback calls st.rerun() at the end
+#   3. rerun after click: re-render with this request_id marked resolved;
+#      if more approvals remain, the events stream yields another
+#      approval.request; if not, run.completed arrives.
+#   4. terminal event: persist final text + tool_calls, clear
+#      _pending_run_approval, render the closing assistant message.
+
+# Render the approval-wait block BEFORE the chat_input so the warning +
+# button row appear at the bottom of the chat history. The disabled
+# chat_input below is a no-op visual cue while a run is pending.
+_PENDING_KEY = "_pending_run_approval"
+_pending = st.session_state.get(_PENDING_KEY)
+
+
+def _run_approval_wait_block() -> None:
+    """Block the script run while a run needs human approval.
+
+    Called from the main flow whenever `_pending_run_approval` is set in
+    session_state. Connects to the gateway's public run events stream,
+    renders one row of `st.button`s per `approval.request` event, and
+    st.rerun()s on terminal events so the next pass persists the final
+    assistant message.
+
+    Idempotent across reruns: each rerun reconnects to the events stream
+    and ignores request_ids already in `_pending["resolved"]`. The
+    gateway re-emits `approval.request` for any unresolved request until
+    the operator submits, so reconnection is safe.
+    """
+    if not _pending:
+        return
+    response_id: str = _pending.get("response_id", "")
+    text_so_far: str = _pending.get("text_so_far", "")
+    tool_calls_so_far: list = _pending.get("tool_calls", [])
+    resolved: set[str] = set(_pending.get("resolved") or [])
+    if not response_id:
+        st.session_state.pop(_PENDING_KEY, None)
+        return
+
+    # Visual: freeze the assistant message bubble with everything we have
+    # so far (text streamed before the park + any tool calls we already
+    # know about) and the ⏸ warning. The run.completed re-render below
+    # will replace this bubble with the final message.
+    with st.chat_message("assistant"):
+        if text_so_far:
+            st.markdown(text_so_far)
+        if tool_calls_so_far:
+            with st.expander(
+                f"🔧 Tool calls so far ({len(tool_calls_so_far)})",
+                expanded=False,
+            ):
+                for tc in tool_calls_so_far:
+                    st.markdown(f"**`{tc.get('name', '?')}`**")
+        st.warning("⏸ Agent is waiting for approval…")
+        event_iter = None
+        try:
+            event_iter = hermes_client.iter_run_events(response_id)
+        except hermes_client.HermesAuthError as e:
+            st.error(
+                f"🔑 **Hermes auth failed while reading run events.** "
+                f"({e})"
+            )
+            hermes_client.log_chat_event(
+                "chat_approval_stream_error",
+                user_id=user_id,
+                session_id=_pending.get("chat_session_id"),
+                response_id=response_id,
+                error_type="HermesAuthError",
+                error=str(e),
+            )
+            st.session_state.pop(_PENDING_KEY, None)
+            st.stop()
+        except hermes_client.HermesAPIError as e:
+            st.error(
+                f"❌ **Hermes API error on /v1/runs/{_short_id(response_id)}/events.** "
+                f"Status {e.status}. Body: `{e.body[:200]}`"
+            )
+            hermes_client.log_chat_event(
+                "chat_approval_stream_error",
+                user_id=user_id,
+                session_id=_pending.get("chat_session_id"),
+                response_id=response_id,
+                error_type="HermesAPIError",
+                error=str(e),
+                status=e.status,
+            )
+            st.session_state.pop(_PENDING_KEY, None)
+            st.stop()
+        except httpx.RequestError as e:
+            # Network drop — do NOT auto-retry (a stale stream could
+            # double-fire the approval submission). Tell the user to
+            # use Telegram/Desktop if the agent is still waiting there.
+            st.error(
+                f"⚠️ **Approval stream dropped** — `iter_run_events` lost the "
+                f"connection. The agent may still be parked on the server. "
+                f"Switch to Telegram or Hermes Desktop to approve there, "
+                f"or retry this page. (`{_short_id(response_id)}`)"
+            )
+            hermes_client.log_chat_event(
+                "chat_approval_stream_error",
+                user_id=user_id,
+                session_id=_pending.get("chat_session_id"),
+                response_id=response_id,
+                error_type=type(e).__name__,
+                error=str(e),
+            )
+            st.session_state.pop(_PENDING_KEY, None)
+            st.stop()
+
+        if event_iter is None:
+            # Defensive: st.stop() in every except branch should prevent
+            # reaching here, but if a future refactor drops one, bail
+            # rather than iterating None.
+            st.session_state.pop(_PENDING_KEY, None)
+            st.stop()
+
+        # Drive the events stream. We loop until we find an unhandled
+        # approval.request (render its button row) or a terminal event
+        # (persist final message + clear pending state).
+        final_event: dict | None = None
+        for event in event_iter:
+            et = event.get("type") or event.get("event") or ""
+            if et == "approval.request":
+                request_id: str = str(event.get("request_id", ""))
+                # smart_denied or allow_session=false → gateway drops
+                # "session"/"always" from choices; render whatever
+                # the gateway sent, don't hardcode.
+                choices: list[str] = list(event.get("choices") or [])
+                command_preview: str = str(event.get("command", "") or "")
+                smart_denied: bool = bool(event.get("smart_denied"))
+                if not request_id or not choices:
+                    # Malformed event — log + skip; the loop will keep
+                    # going to the next event.
+                    hermes_client.log_chat_event(
+                        "chat_approval_malformed_event",
+                        user_id=user_id,
+                        session_id=_pending.get("chat_session_id"),
+                        response_id=response_id,
+                        event=event,
+                    )
+                    continue
+                if request_id in resolved:
+                    # Already handled in a previous rerun; skip without
+                    # re-rendering the button row.
+                    continue
+                # Show the (already-redacted) command + the choices the
+                # gateway offered. Display the redacted text verbatim
+                # — don't try to re-parse or un-redact.
+                if command_preview:
+                    st.caption(f"Command: `{command_preview}`")
+                if smart_denied:
+                    st.caption("⚠️ Smart-denied: persistent choice disabled.")
+                hermes_client.log_chat_event(
+                    "chat_approval_prompted",
+                    user_id=user_id,
+                    session_id=_pending.get("chat_session_id"),
+                    response_id=response_id,
+                    request_id=request_id,
+                    choices=choices,
+                    command_preview_len=len(command_preview),
+                )
+                # Render one button per choice. on_click callbacks run
+                # in the SAME rerun — submit_run_approval is sync and
+                # fast, so we mutate session_state inside the callback
+                # then trigger a rerun via st.rerun() AFTER returning
+                # from the callback.
+                cols = st.columns(len(choices))
+                for col, choice in zip(cols, choices):
+                    def _on_approve_click(
+                        _choice: str = choice,
+                        _request_id: str = request_id,
+                        _response_id: str = response_id,
+                    ) -> None:
+                        ok = hermes_client.submit_run_approval(
+                            _response_id, _choice, _request_id,
+                        )
+                        hermes_client.log_chat_event(
+                            "chat_approval_resolved",
+                            user_id=user_id,
+                            session_id=_pending.get("chat_session_id"),
+                            response_id=_response_id,
+                            request_id=_request_id,
+                            choice=_choice,
+                            accepted=ok,
+                        )
+                        if ok:
+                            # Mark this request_id resolved so the next
+                            # rerun doesn't re-render its button row.
+                            _pending.setdefault("resolved", []).append(
+                                _request_id,
+                            )
+                            st.session_state[_PENDING_KEY] = _pending
+                        else:
+                            # 409 / 404 — the gateway already cleared
+                            # the approval. Drop the pending state so
+                            # the next pass falls through to the chat
+                            # submit path.
+                            st.session_state.pop(_PENDING_KEY, None)
+                    with col:
+                        st.button(
+                            choice,
+                            key=f"approve_{response_id}_{request_id}_{choice}",
+                            on_click=_on_approve_click,
+                        )
+                # Rendered the button row for this approval.request.
+                # Stop iterating so the user can click; the next rerun
+                # (from the click) resumes from the events stream.
+                return
+            elif et in ("run.completed", "run.failed", "run.cancelled"):
+                final_event = event
+                break
+            # Other event types (e.g. tool_progress, intermediate
+            # status) — ignore and keep iterating until we see a
+            # terminal or approval.request.
+
+        # Loop exited without rendering a button row → either terminal
+        # event arrived OR the events stream ended without one.
+        if final_event is not None:
+            et = final_event.get("type") or final_event.get("event") or ""
+            chat_sid = _pending.get("chat_session_id")
+            if et == "run.completed":
+                # Final assistant message: merge any final text + tool
+                # output from the event into the same shape the
+                # non-approval path uses.
+                resp = final_event.get("response", {}) or {}
+                final_output = resp.get("output", []) or []
+                final_text, final_tcs = hermes_client._extract_text_and_tools(
+                    final_output,
+                )
+                merged_text = (text_so_far + ("\n" if text_so_far and final_text else "")
+                               + final_text) if final_text else text_so_far
+                # Merge tool_calls: existing + final-pass call_id→output.
+                merged_tcs = list(tool_calls_so_far)
+                seen_ids = {tc.get("call_id") or tc.get("id") for tc in merged_tcs}
+                for item in final_output:
+                    if item.get("type") in ("function_call", "tool_call"):
+                        cid = item.get("call_id") or item.get("id")
+                        if cid in seen_ids:
+                            # Update existing entry with output
+                            for tc in merged_tcs:
+                                if (tc.get("call_id") or tc.get("id")) == cid:
+                                    tc["output"] = item.get("output")
+                                    break
+                        else:
+                            merged_tcs.append(item)
+                # Persist into the chat DB. Skip the duplicate persist
+                # if the response_id already has an assistant row
+                # (defensive — should not happen on the happy path).
+                add_chat_message(
+                    session_id=chat_sid,
+                    role="assistant",
+                    content=merged_text or "(no text in response — see tool calls)",
+                    response_id=response_id,
+                    tool_calls_json=(
+                        json.dumps(merged_tcs) if merged_tcs else None
+                    ),
+                )
+                hermes_client.log_chat_event(
+                    "chat_response_received",
+                    user_id=user_id,
+                    session_id=chat_sid,
+                    role="assistant",
+                    msg_len=len(merged_text),
+                    response_id=response_id,
+                    tool_call_count=len(merged_tcs),
+                    via_approval_resume=True,
+                )
+                # Render the final assistant bubble in this run so the
+                # user sees the result immediately.
+                with st.chat_message("assistant"):
+                    if merged_text:
+                        st.markdown(merged_text)
+                    if merged_tcs:
+                        with st.expander(
+                            f"🔧 Tool calls ({len(merged_tcs)})",
+                            expanded=False,
+                        ):
+                            for tc in merged_tcs:
+                                name = tc.get("name", "?")
+                                args = tc.get("arguments", "")
+                                tc_out = tc.get("output")
+                                st.markdown(f"**`{name}`**")
+                                if args:
+                                    st.code(args, language="json")
+                                if tc_out is not None:
+                                    out_str = (
+                                        tc_out if isinstance(tc_out, str)
+                                        else json.dumps(tc_out)
+                                    )
+                                    truncated = (
+                                        out_str[:200] + "…"
+                                        if len(out_str) > 200 else out_str
+                                    )
+                                    st.caption(
+                                        f"↳ result: `{truncated}`"
+                                    )
+            else:
+                # run.failed or run.cancelled
+                st.error(
+                    f"❌ **Agent run {et.removeprefix('run.')}.** "
+                    f"Check Telegram/Desktop for the full failure trail. "
+                    f"Run id: `{_short_id(response_id)}`"
+                )
+                hermes_client.log_chat_event(
+                    "chat_run_terminated",
+                    user_id=user_id,
+                    session_id=chat_sid,
+                    response_id=response_id,
+                    final_event_type=et,
+                )
+            st.session_state.pop(_PENDING_KEY, None)
+            return
+        # Stream ended without a terminal event (e.g. the run was so
+        # short the events stream wrapped up before we reconnected).
+        # Fall through and clear pending — the next chat_input submit
+        # will start a fresh turn.
+        st.session_state.pop(_PENDING_KEY, None)
+
+
+_run_approval_wait_block()
+
+# chat_input is the normal entry point. While a run is pending approval
+# we keep it visible but disabled so the user knows the previous turn
+# is still in flight (typing a new prompt would silently create a
+# new run that wouldn't be the one waiting for approval).
+prompt = st.chat_input(
+    "Ask IT_ADMIN…",
+    disabled=bool(_pending),
+)
 
 if prompt:
     hermes_client.log_chat_event(
@@ -306,6 +652,7 @@ if prompt:
     # when a httpx.TimeoutException fires mid-stream (everything else
     # st.stop()s and never reaches here).
     result: dict = {"session_id": "", "response_id": "", "text": "", "tool_calls": [], "raw": None}
+    response_id: str = ""
 
     try:
         if is_new:
@@ -458,12 +805,56 @@ if prompt:
     text = result.get("text", "") or ""
     tool_calls = result.get("tool_calls", []) or []
 
-    # Persist user + assistant messages.
+    # BACKLOG #97 — approval-wait gate. After the chat SSE returns, the
+    # gateway may still be waiting for a tool-level human approval (the
+    # chat SSE stream silently dropped the approval.request event). If
+    # the run is parked, defer persistence + rendering to the
+    # approval-wait block: stash the partial state in session_state and
+    # rerun. The wait block consumes the public run events stream and
+    # persists the final message when run.completed lands.
+    #
+    # Note: `add_chat_message(role="user", ...)` below runs FIRST so the
+    # user message is always recorded even if the approval path hangs.
     add_chat_message(
         session_id=active_session_id,
         role="user",
         content=prompt,
     )
+    if response_id:
+        try:
+            run_status = hermes_client.get_run_status(response_id)
+        except Exception as e:  # noqa: BLE001
+            run_status = None
+            hermes_client.log_chat_event(
+                "chat_run_status_error",
+                user_id=user_id,
+                session_id=active_session_id,
+                response_id=response_id,
+                error_type=type(e).__name__,
+                error=str(e),
+            )
+        if run_status and run_status.get("status") == "waiting_for_approval":
+            # Skip the assistant message persistence here — the
+            # approval-wait block persists the FINAL assistant message
+            # on run.completed. Persisting twice would produce two
+            # assistant rows for the same response_id.
+            st.session_state[_PENDING_KEY] = {
+                "response_id": response_id,
+                "chat_session_id": active_session_id,
+                "text_so_far": text,
+                "tool_calls": tool_calls,
+                "resolved": [],
+                "prompt": prompt,
+            }
+            hermes_client.log_chat_event(
+                "chat_approval_wait_started",
+                user_id=user_id,
+                session_id=active_session_id,
+                response_id=response_id,
+                tool_call_count=len(tool_calls),
+            )
+            st.rerun()
+
     add_chat_message(
         session_id=active_session_id,
         role="assistant",

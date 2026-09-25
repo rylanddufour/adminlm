@@ -577,6 +577,167 @@ def _stream_chat_turn(json_body: dict):
 # (Definition lives at the top of the file alongside _hermes_request.)
 
 
+# ---------------------------------------------------------------------------
+# Run lifecycle (Card 5 — Agent Chat + Chat Sessions, BACKLOG #64 / #97)
+# ---------------------------------------------------------------------------
+#
+# Public run endpoints on Hermes gateway (BACKLOG #97 — Agent Chat approval
+# UX). The gateway exposes these endpoints at the ROOT of its API server
+# (NOT under /v1/), so the URL is `_api_base() + "/v1/runs/{id}"` even
+# though the docstring in `api_server_runs.py:711-720` calls them
+# "external UI" polling endpoints. Three functions:
+#
+#   * get_run_status(response_id) — snapshot status; cheap, non-streaming
+#   * iter_run_events(response_id) — SSE stream of structured lifecycle events
+#   * submit_run_approval(response_id, choice, request_id) — resolve a pending
+#     approval so the agent thread unblocks
+#
+# Auth: every call goes through `_hermes_request()` which adds the same
+# Authorization + X-Hermes-Profile headers the chat uses. No new env vars.
+#
+# Stability (BACKLOG #97 acceptance criterion #6): these endpoints have been
+# in Hermes since at least v0.18 (verified via `api_server_runs.py` git
+# blame on .220). Surviving a Hermes pip upgrade is BY CONSTRUCTION — we
+# never touch the gateway package, only consume its public surface.
+
+
+# Streaming read timeout for iter_run_events. Approval flows can take a while
+# (multi-step agent work between prompts). 5 min matches the chat SSE
+# budget. Per-event keepalives aren't strictly needed because the gateway
+# emits heartbeat comments (verified in `api_server_runs.py` write path).
+_RUN_EVENTS_TIMEOUT = httpx.Timeout(connect=10.0, read=300.0, write=120.0, pool=10.0)
+
+
+def get_run_status(response_id: str) -> dict | None:
+    """Return the current run status dict, or None on 404 / transport failure.
+
+    Shape on success:
+        {
+            "object": "hermes.run",
+            "run_id": "<uuid or resp_...>",
+            "status": "queued" | "running" | "waiting_for_approval"
+                      | "completed" | "failed" | "cancelled",
+            "approval": {...} | None,         # present when waiting_for_approval
+            "started_at": <epoch>, "last_event": "...", ...
+        }
+
+    Returns None on 404 (run already retired) or any network/HTTP error.
+    Callers MUST treat None as "the run is done or unknown" — never as
+    "retry". A None return is the correct exit signal for the approval-wait
+    state machine: the agent finished while we were polling.
+    """
+    if not response_id:
+        return None
+    try:
+        r = _hermes_request("GET", f"v1/runs/{response_id}")
+        if r.status_code == 404:
+            return None
+        _raise_for_status(r)
+        return r.json()
+    except (HermesClientError, httpx.RequestError):
+        return None
+
+
+def iter_run_events(response_id: str):
+    """Yield structured run lifecycle events from the gateway SSE stream.
+
+    Yields dicts with the same shape as the chat SSE consumer:
+        {"type": "approval.request", "request_id": "...", "choices": [...],
+         "command": "<redacted>", "smart_denied": bool, ...}
+        {"type": "run.completed", "response_id": "...", "output": [...], ...}
+        {"type": "run.failed", "error": "..."}
+        {"type": "run.cancelled"}
+
+    Stops automatically when a terminal event arrives (run.completed /
+    run.failed / run.cancelled). Auto-closes the underlying HTTPX stream.
+
+    Raises:
+        HermesAuthError, HermesAPIError, httpx.RequestError — caller decides
+        whether to surface, retry, or fall back to a status snapshot.
+    """
+    if not response_id:
+        return
+    # _hermes_request resolves v1/* to base+/v1/..., but the actual gateway
+    # path for run endpoints is `/v1/runs/{id}` even though it lives under
+    # the v1 namespace. _hermes_request strips the leading `v1/` cleanly;
+    # we keep the path explicit so future readers see the wire shape.
+    headers = {
+        "Authorization": f"Bearer {hermes_api_key()}",
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+        "X-Hermes-Profile": hermes_profile(),
+    }
+    base = _api_base()
+    url = f"{base}/v1/runs/{response_id}/events"
+    with httpx.Client(timeout=_RUN_EVENTS_TIMEOUT) as client:
+        with client.stream("GET", url, headers=headers) as r:
+            if r.status_code == 404:
+                return
+            if r.status_code in (401, 403):
+                raise HermesAuthError(
+                    f"Hermes auth failed on /v1/runs/{response_id}/events: "
+                    f"{r.status_code}"
+                )
+            if r.status_code >= 400:
+                snippet = b""
+                try:
+                    for chunk in r.iter_bytes(chunk_size=4096):
+                        snippet += chunk
+                        if len(snippet) > 4096:
+                            break
+                except Exception:
+                    pass
+                raise HermesAPIError(
+                    r.status_code,
+                    snippet[:2000].decode(errors="replace"),
+                    str(r.url),
+                )
+            for event in _iter_sse_events(r):
+                yield event
+                et = event.get("type") or event.get("event") or ""
+                if et in ("run.completed", "run.failed", "run.cancelled"):
+                    return
+
+
+def submit_run_approval(
+    response_id: str,
+    choice: str,
+    request_id: str | None = None,
+) -> bool:
+    """Resolve a pending approval on a run. Returns True on accepted submit.
+
+    Args:
+        response_id: the run/response handle returned by start_chat_streaming.
+        choice: one of "once", "session", "always", "deny" — must match one
+            of the choices the gateway emitted in the approval.request event
+            (use the `choices` list from `iter_run_events()` for validation).
+        request_id: optional approval-request id. Some approval flows (room /
+            coordinated) require the exact request_id; for the single-agent
+            chat path it's optional.
+
+    Returns:
+        True if the gateway accepted (HTTP 2xx with `{"deleted": True, ...}`
+        or `{"object": "hermes.run.approval_response", ...}`).
+        False on 409 (approval no longer pending — the agent already
+        resumed/cancelled), 404, or any network error.
+    """
+    if not response_id:
+        return False
+    body: dict[str, Any] = {"choice": choice}
+    if request_id:
+        body["request_id"] = request_id
+    try:
+        r = _hermes_request(
+            "POST", f"v1/runs/{response_id}/approval", json_body=body,
+        )
+        if r.status_code in (404, 409):
+            return False
+        _raise_for_status(r)
+        return True
+    except (HermesClientError, httpx.RequestError):
+        return False
+
+
 def list_sessions(user_id: int | None = None) -> list[dict]:
     """List Hermes-side chat sessions.
 
