@@ -630,6 +630,86 @@ substitute_host_ip() {
 }
 
 # ============================================
+# Substitute Streamlit Quick Links host IP
+# ============================================
+# BACKLOG #90 — sibling to substitute_host_ip() above. The Streamlit
+# Quick Links (OPEN_HERMES_URL / OPEN_GRAFANA_URL / OPEN_INVENTORY_URL
+# defaults in streamlit-ui-stack/streamlit-app/settings.py) ship with
+# the canonical .220 homelab IP. On any other customer install every
+# Quick Link on the Settings page points at the wrong host and the
+# operator's "click to open in browser" buttons all 404. Fix: detect
+# the host's primary external IP at install time and sed-replace
+# `192.168.0.220` with the actual host IP in settings.py. Idempotent
+# — safe on re-run (uses a `# host-substituted: <ip>` sentinel
+# comment so the substitution only happens once per host).
+#
+# Only the OPEN_*_URL string literals in the EDITABLE_FIELDS
+# `default:` keys are touched (and the load() function's _env_or
+# defaults that use the same literal). Backend URLs (KB_MCP_URL etc.)
+# stay on container-internal hostnames like http://kb-mcp:8002 — those
+# are NOT host-IP-bearing and must NOT be substituted.
+#
+# Note: BACKLOG #90 describes this as `192.168.0.220` -> <host_ip>.
+# The OPEN_KB_URL entry was already removed from EDITABLE_FIELDS as
+# part of the BACKLOG #73 item 6b cleanup (KB web UI commented out),
+# so its literal `192.168.0.220:8002` is also gone from this file.
+# Nothing in this function rewrites anything other than OPEN_*_URL
+# defaults.
+
+substitute_streamlit_quicklinks() {
+    local infra_dir="${INFRA_DIR:?INFRA_DIR not set — main() must clone repo first}"
+    local settings_py="$infra_dir/streamlit-ui-stack/streamlit-app/settings.py"
+
+    if [ ! -f "$settings_py" ]; then
+        log_warn "streamlit settings.py not found at $settings_py; skipping Quick Links host IP substitution"
+        return 0
+    fi
+
+    # Sentinel: same pattern as substitute_host_ip(). The sentinel lives
+    # in a Python comment so it never affects the Streamlit runtime.
+    if grep -q '^# host-substituted:' "$settings_py"; then
+        local existing_ip
+        # Sentinel line is `# host-substituted: <ip>` — three whitespace-
+        # separated tokens, IP at $3.
+        existing_ip="$(grep '^# host-substituted:' "$settings_py" | head -1 | awk '{print $3}')"
+        log_info "streamlit settings.py already host-substituted (host=$existing_ip); skipping"
+        return 0
+    fi
+
+    # Detect the host's primary external IP via the default route's src.
+    # Same mechanism as substitute_host_ip() — falls back to hostname -I
+    # when `ip route get` is unavailable.
+    local host_ip
+    host_ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ {print $7; exit}')"
+    if [ -z "$host_ip" ]; then
+        host_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    fi
+    if [ -z "$host_ip" ]; then
+        log_warn "Could not detect host external IP; streamlit Quick Links will keep the canonical .220 defaults until fixed manually"
+        return 0
+    fi
+
+    # Count + substitute. The 192.168.0.220 literal currently appears in
+    # the OPEN_HERMES_URL / OPEN_GRAFANA_URL / OPEN_INVENTORY_URL defaults
+    # (3 sites as of the BACKLOG #90 patch — OPEN_KB_URL was removed from
+    # the UI in the same change). Sed replaces all of them atomically; the
+    # port suffixes (9119 / 3000 / 8001) are preserved because sed only
+    # touches the IP literal.
+    local count
+    count="$(grep -c '192\.168\.0\.220' "$settings_py" || true)"
+    if [ "$count" = "0" ]; then
+        log_info "No 192.168.0.220 references in streamlit settings.py; nothing to substitute (host_ip=$host_ip)"
+        sed -i "1i # host-substituted: $host_ip" "$settings_py"
+        return 0
+    fi
+
+    sed -i "s|192\.168\.0\.220|${host_ip}|g" "$settings_py"
+    sed -i "1i # host-substituted: $host_ip" "$settings_py"
+
+    log_success "Substituted $count 192.168.0.220 references in streamlit settings.py → ${host_ip} (BACKLOG #90)"
+}
+
+# ============================================
 # Configure Hermes with API Key
 # ============================================
 
@@ -2899,6 +2979,12 @@ main() {
     # compose up that reads the file (Prometheus is bind-mounted from
     # $INFRA_DIR/config/prometheus.yml).
     substitute_host_ip
+    # BACKLOG #90 — sibling pass for the Streamlit Quick Links defaults
+    # in streamlit-ui-stack/streamlit-app/settings.py. Same ip detection
+    # + sentinel pattern as the prometheus pass above. Runs before
+    # streamlit-ui deploys so a fresh install has the right host IP from
+    # the first container start (no Settings-page override needed).
+    substitute_streamlit_quicklinks
 
     configure_hermes_api
     provision_api_server_key

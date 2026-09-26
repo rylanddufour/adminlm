@@ -5,8 +5,13 @@
 # Two groups of URLs:
 #   - Backend URLs (used for /health probes, container-to-container):
 #     hermes_url, kb_url, inventory_url, loki_url, ansible_runner_url.
-#   - Quick Links (browser-facing, host-IP):
-#     open_hermes_url, open_grafana_url, open_kb_url, open_inventory_url.
+#   - Quick Links (browser-facing, host IP):
+#     open_hermes_url, open_grafana_url, open_inventory_url.
+#     (open_kb_url removed from the surfaced set — KB is a v1.0
+#     read-only inventory of agent playbooks/notes; the Home page
+#     Quick Links never rendered it and the Settings form no longer
+#     exposes it. The dataclass field is kept for env-override
+#     backwards-compatibility but no UI surface reads it.)
 #
 # Both groups persist in ui_settings. Health probes use Backend URLs
 # (docker-internal hostnames). The Home page's Quick Links buttons
@@ -16,6 +21,13 @@
 # v1.0 customer stack sets these in docker-compose.yml. The Settings
 # page can override any URL via the ui_settings table; those
 # overrides take precedence over env.
+#
+# Host-IP substitution (BACKLOG #90): the OPEN_*_URL defaults below
+# ship with the canonical .220 homelab IP. bootstrap.sh's
+# substitute_streamlit_quicklinks() rewrites them at install time to
+# the customer's actual host IP and writes a `# host-substituted: <ip>`
+# sentinel so re-runs skip cleanly. Same pattern as
+# substitute_host_ip() (BACKLOG #87 / prometheus.yml).
 
 from __future__ import annotations
 
@@ -79,11 +91,13 @@ class Settings:
         """List of (label, url) for the Home page Quick Links buttons.
 
         Uses the Quick Links group (browser-facing, host IP).
+        KB MCP was removed in the same patch (BACKLOG #73 item 6b):
+        the kb-mcp web UI is comment-outed and the operator reaches
+        KB content through the Streamlit KB Search sidebar page.
         """
         return [
             ("Open Hermes Dashboard", self.open_hermes_url),
             ("Open Grafana", self.open_grafana_url),
-            ("Open KB MCP", self.open_kb_url),
             ("Open Inventory MCP", self.open_inventory_url),
         ]
 
@@ -224,13 +238,6 @@ EDITABLE_FIELDS: list[dict] = [
         "label": "Grafana (browser)",
         "default": "http://192.168.0.220:3000",
         "help": "Browser-facing Grafana URL. Example: http://192.168.0.220:3000.",
-    },
-    {
-        "key": "OPEN_KB_URL",
-        "group": "Quick Links",
-        "label": "KB MCP (browser)",
-        "default": "http://192.168.0.220:8002",
-        "help": "Browser-facing KB MCP URL. Example: http://192.168.0.220:8002.",
     },
     # --- Identity ---
     {
