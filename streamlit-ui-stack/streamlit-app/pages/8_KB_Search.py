@@ -101,18 +101,35 @@ with fcol1:
         value=st.session_state.get("kb_search_query", ""),
         placeholder="e.g. restart streamlit  (or 'cisc' for prefix-match, \"exact phrase\", OR)",
         key="kb_search_query_input",
+        # BACKLOG #73 item 5: streamlit's tooltip renderer collapses single
+        # \n to a space (confirmed on .220 2026-10-01 — the bullet list
+        # rendered as one wall of text). The Trust Level tooltip above
+        # works because it uses \n\n between every line. Match that
+        # pattern here.
         help=(
             "FTS5 syntax (kb-mcp's flavor):\n"
-            "• Plain words match anywhere. The LAST token is auto-prefix-matched "
-            "(e.g. `cisc` finds `Cisco`, `Cisco switch SSH`).\n"
-            "• Explicit prefix: `cisco*` matches anything starting with `cisco`.\n"
+            "\n"
+            "• Plain word: matches anywhere in the entry.\n"
+            "\n"
+            "• Last word auto-prefixed: `cisc` finds Cisco, Cisco switch, etc.\n"
+            "\n"
+            "• Explicit prefix: `cisco*` matches anything starting with cisco.\n"
+            "\n"
             "• Multiple prefixes: `cisco* OR juniper*`.\n"
-            "• Exact phrase: `\"streamlit restart\"` (the quotes keep the words together).\n"
-            "• Column restrict: `title:cisco` (matches only the title column).\n"
-            "• FTS5 is PREFIX-ONLY — `*sco`, `*lit`, `*sw*` and `?isco` are NOT supported "
-            "(the FTS5 engine only does `prefix*`, not suffix or substring). "
-            "For suffix/substring matching, fall back to plain words "
-            "(last-token auto-prefix still applies) or use multiple `prefix*` terms joined with OR."
+            "\n"
+            "• Exact phrase: `\"streamlit restart\"` keeps words together.\n"
+            "\n"
+            "• Column restrict: `title:cisco` searches the title column only.\n"
+            "\n"
+            "NOT supported (FTS5 is prefix-only):\n"
+            "\n"
+            "• Suffix: `*sco` — no match.\n"
+            "\n"
+            "• Substring/wildcard: `*lit`, `*sw*`, `?isco` — no match.\n"
+            "\n"
+            "• For suffix/substring, use plain words (auto-prefix applies)\n"
+            "\n"
+            "  or multiple `prefix*` terms joined with OR."
         ),
     )
 with fcol2:
