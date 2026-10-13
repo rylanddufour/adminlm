@@ -1,0 +1,107 @@
+# BACKLOG #94 Phase 1 — Infisical OSS stack for AdminLM.
+#
+# Customer never reaches this UI (bound to 127.0.0.1:8090 only). The Streamlit
+# Secrets page (Phase 3) is the only surface the operator touches. Today this
+# file just brings up the 3-service stack so Phase 3+ have something to talk to.
+#
+# Image pin: v0.166.2 (Docker Hub tags API, released 2026-10-07). Per BACKLOG #86
+# lesson (grafana/mcp-grafana:0.5.0 didn't exist on Docker Hub) — never pin to
+# :latest. Re-verify the tag exists on Docker Hub before bumping.
+#
+# References:
+#   - Official upstream compose: https://github.com/Infisical/infisical/blob/main/docker-compose.prod.yml
+#   - .env.example keys:          https://github.com/Infisical/infisical/blob/main/.env.example
+#   - Backend listens on $PORT (default 8080 → overridden to 8090 here)
+#   - DB_CONNECTION_URI is constructed from POSTGRES_HOST/USER/PASSWORD/DB/DB_PORT at runtime
+#
+# Idempotency: bootstrap.sh's deploy_infisical_stack() generates the secrets
+# file once and writes INFISICAL_BOOTSTRAP_DONE=true after the first-boot API
+# call. Re-runs read the existing file and skip.
+services:
+  infisical:
+    container_name: infisical
+    image: infisical/infisical:v0.166.2
+    pull_policy: always
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      infisical-postgres:
+        condition: service_healthy
+      infisical-redis:
+        condition: service_started
+    environment:
+      - NODE_ENV=production
+      # Backend listens on $PORT (default 8080). Override to 8090 so the
+      # 127.0.0.1:8090:8090 mapping lines up with the card's loopback-only
+      # binding — customer never reaches it from their network.
+      - PORT=8090
+    ports:
+      # BACKLOG #94 AC: bound to 127.0.0.1, NOT 0.0.0.0. Customer cannot reach
+      # the Infisical UI from their network; Streamlit (Phase 3) is the only
+      # operator-facing surface.
+      - "127.0.0.1:8090:8090"
+    networks:
+      - infisical
+    healthcheck:
+      # /api/status returns 503 before first-boot bootstrap, 200 after.
+      # We don't fail the container on 503 — first boot is a one-time state.
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8090/api/status || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  infisical-postgres:
+    container_name: infisical-postgres
+    image: postgres:14-alpine
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    volumes:
+      - infisical-pg-data:/var/lib/postgresql/data
+    networks:
+      - infisical
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready --username=${POSTGRES_USER} --dbname=${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  infisical-redis:
+    container_name: infisical-redis
+    image: redis:7-alpine
+    restart: unless-stopped
+    # --requirepass enforces a password on every connection. AUTH is passed
+    # in the URL as redis://:password@host:6379. The compose file uses
+    # REDIS_URL from the .env file, which bootstrap.sh builds from the
+    # generated REDIS_PASSWORD.
+    command:
+      - redis-server
+      - --requirepass
+      - ${REDIS_PASSWORD}
+      - --appendonly
+      - "yes"
+    volumes:
+      - infisical-redis-data:/data
+    networks:
+      - infisical
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  infisical-pg-data:
+    driver: local
+  infisical-redis-data:
+    driver: local
+
+networks:
+  infisical:
+    driver: bridge
+    name: infisical
