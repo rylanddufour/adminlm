@@ -44,6 +44,7 @@ class Settings:
     prometheus_url: str
     grafana_url: str
     ansible_runner_url: str
+    infisical_url: str
     # Quick Links (browser-facing, host IP)
     open_hermes_url: str
     open_grafana_url: str
@@ -128,6 +129,9 @@ def load() -> Settings:
         grafana_url=_env_or(
             "GRAFANA_URL", "http://grafana:3000",
         ),
+        infisical_url=_env_or(
+            "INFISICAL_URL", "http://infisical:8090",
+        ),
         # Quick Links (browser-facing, host IP). Defaults point at
         # the same host IP the operator types into the Settings page
         # most often. Override per field if a service is on a
@@ -207,6 +211,18 @@ EDITABLE_FIELDS: list[dict] = [
         "label": "Ansible Runner",
         "default": "http://adminlm-ansible-runner:8000",
         "help": "Internal URL for the /health probe. Container-internal.",
+    },
+    {
+        "key": "INFISICAL_URL",
+        "group": "Backend URLs",
+        "label": "Infisical (BACKLOG #94)",
+        "default": "http://infisical:8090",
+        "help": "Internal URL for the Infisical API (used by the Secrets "
+                "page, BACKLOG #94 Phase 3). Container-internal; reachable "
+                "because streamlit-ui is attached to the `infisical` Docker "
+                "network. Phase 3 read-only MVP — the operator token grants "
+                "Viewer role, so /api/v3/secrets/raw returns the listed "
+                "secrets and nothing else.",
     },
     # --- Quick Links (browser-facing, host IP) ---
     {

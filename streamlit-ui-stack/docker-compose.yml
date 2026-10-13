@@ -12,6 +12,7 @@
 #   - kb-mcp:8002                   (BACKLOG #39; KB search; Card 6)
 #   - inventory-mcp:8001            (BACKLOG #39.2; device inventory; Card 6)
 #   - loki:3100                     (log query; out of scope this card)
+#   - infisical:8090                 (BACKLOG #94 Phase 3; Secrets page)
 #
 # What streamlit-ui does NOT touch:
 #   - /var/run/docker.sock — that's adminlm-ansible-runner's job (Card 2).
@@ -45,6 +46,7 @@ services:
       - "host.docker.internal:host-gateway"
     networks:
       - monitoring
+      - infisical
     volumes:
       # SQLite DB lives here. Loki logs go to a SIBLING bind mount
       # below — see comment on the log mount.
@@ -108,6 +110,23 @@ services:
       - LOKI_URL=${LOKI_URL:-http://loki:3100}
       - ANSIBLE_RUNNER_URL=${ANSIBLE_RUNNER_URL:-http://adminlm-ansible-runner:8000}
       - GRAFANA_URL=${GRAFANA_URL:-http://grafana:3000}
+      # ---- Infisical (BACKLOG #94 Phase 3 — Secrets page) ----
+      # INFISICAL_URL points at the `infisical` container on the shared
+      # `infisical` Docker network (declared under `networks:` below).
+      # bootstrap.sh deploy_infisical_stack() generates the operator
+      # machine-identity token and writes it to
+      # ~/.hermes/secrets/infisical-operator.env (chmod 600). The
+      # INFISICAL_OPERATOR_TOKEN / INFISICAL_PROJECT_ID env vars below
+      # resolve from that file at `docker compose up -d` time — bootstrap
+      # `source`s the file (matches HERMES_API_KEY pattern) so this page
+      # can call /api/v3/secrets/raw without ever seeing the operator
+      # plaintext in docker inspect output (compose expandenv resolves
+      # BEFORE the container starts; the resolved value is still visible
+      # via `docker inspect`, so production should rotate via the
+      # operator env file rather than echoing it on the CLI).
+      - INFISICAL_URL=${INFISICAL_URL:-http://infisical:8090}
+      - INFISICAL_OPERATOR_TOKEN=${INFISICAL_OPERATOR_TOKEN:-}
+      - INFISICAL_PROJECT_ID=${INFISICAL_PROJECT_ID:-}
       # Card 4 (Run Playbook): HMAC shared secret for signing POSTs to
       # adminlm-ansible-runner. MUST match the runner's
       # RUNNER_HMAC_SECRET (default "dev-secret-rotate-me"). The runner
@@ -159,4 +178,6 @@ services:
 
 networks:
   monitoring:
+    external: true
+  infisical:
     external: true
