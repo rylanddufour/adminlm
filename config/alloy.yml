@@ -135,3 +135,36 @@ loki.write "adminlm_streamlit" {
         url = "http://loki:3100/loki/api/v1/push"
     }
 }
+
+// ----------------------------------------------------------------------------
+// adminlm-infisical-mcp (BACKLOG #94, Phase 5 — read-only agent consumer).
+// Tail NDJSON files written by $HOME/.hermes/logs/adminlm-infisical-mcp/*.log
+// on the host. loki_logger.py (bind-mounted from adminlm-ansible-stack in the
+// infisical-mcp container) appends one NDJSON line per event with stream
+// "infisical_mcp". The bind mount source is chosen so the logs land in a
+// directory the alloy container already has mounted (as
+// ${HOME}/.hermes/logs -> /var/lib/hermes/logs, see docker-compose.yml alloy
+// service) — this avoids adding a new bind mount to the main monitoring stack.
+// Labels {job="adminlm-infisical-mcp", source="adminlm_host"} match the Card 2
+// / Card 3 pattern. Audit fields per BACKLOG #77: {tool, path, secret_key,
+// success, user_id, error?} — NEVER secret_value (see server.py _safe_log_event).
+// ----------------------------------------------------------------------------
+
+local.file_match "adminlm_infisical_mcp" {
+    path_targets = [{
+        __path__ = "/var/lib/hermes/logs/adminlm-infisical-mcp/*.log",
+        job      = "adminlm-infisical-mcp",
+        source   = "adminlm_host",
+    }]
+}
+
+loki.source.file "adminlm_infisical_mcp" {
+    targets    = local.file_match.adminlm_infisical_mcp.targets
+    forward_to = [loki.write.adminlm_infisical_mcp.receiver]
+}
+
+loki.write "adminlm_infisical_mcp" {
+    endpoint {
+        url = "http://loki:3100/loki/api/v1/push"
+    }
+}

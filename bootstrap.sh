@@ -2481,9 +2481,125 @@ EOF
     fi
 
     # ------------------------------------------------------------------
-    # 7) Persist operator creds to ~/.hermes/secrets/infisical-operator.env.
-    #    This file is what downstream phases (Streamlit secrets page, mcp,
-    #    backup integration) will read from. chmod 600 — never group/world.
+    # 6c) BACKLOG #94 Phase 5 — generate the agent-default machine identity.
+    #     Mirrors step 6b (operator identity) but writes the access token
+    #     to a SEPARATE file (~/.hermes/secrets/infisical-agent.env) for
+    #     strict least-privilege separation: the operator token grants
+    #     Streamlit full path-scope CRUD via the Secrets page; the agent
+    #     token grants infisical-mcp read-only access on operator-approved
+    #     paths. A compromised agent token has blast radius = read-only.
+    #
+    #     Idempotency: skip if INFISICAL_AGENT_BOOTSTRAP_DONE=true is
+    #     already set in the agent env file (re-runs MUST NOT invalidate
+    #     the running infisical-mcp's working token).
+    #
+    #     We reuse the same 4-step sequence as step 6b (create identity,
+    #     add universal-auth, login, grant role) but with name
+    #     "agent-default" and target env file infisical-agent.env.
+    # ------------------------------------------------------------------
+    local agent_env="$secrets_dir/infisical-agent.env"
+    local agent_token=""
+    if grep -q '^INFISICAL_AGENT_BOOTSTRAP_DONE=true$' "$agent_env" 2>/dev/null; then
+        agent_token=$(grep '^INFISICAL_AGENT_TOKEN=' "$agent_env" | head -1 | cut -d= -f2- || true)
+        if [ -n "$agent_token" ]; then
+            log_success "INFISICAL_AGENT_TOKEN already set in $agent_env; skipping machine-identity generation"
+        fi
+    fi
+
+    if [ -z "$agent_token" ] && [ -n "$identity_token" ] && [ -n "$project_id" ]; then
+        log_info "Generating read-only agent-default machine identity for infisical-mcp..."
+
+        # Step 1: create machine identity (org-level)
+        local agent_mi_resp agent_mi_id
+        agent_mi_resp=$(curl -sS -o /tmp/infisical-agent-mi.json -w '%{http_code}' --max-time 30 \
+            -H 'Content-Type: application/json' \
+            -H "Authorization: Bearer ***" \
+            -X POST "http://127.0.0.1:8090/api/v1/auth/machine-identities" \
+            -d '{"name":"agent-default","description":"Read-only agent identity for infisical-mcp (BACKLOG #94 Phase 5). Path scope is managed via the operator scope-policy UI."}' \
+            2>/dev/null || echo "000")
+        agent_mi_id=$(jq -r '.machineIdentity.id // empty' /tmp/infisical-agent-mi.json 2>/dev/null || true)
+        if [ -z "$agent_mi_id" ]; then
+            # Maybe the identity already exists (re-run). Try to look it up.
+            log_info "Agent machine identity create did not return id (HTTP $agent_mi_resp) — looking up by name..."
+            agent_mi_id=$(curl -sS --max-time 15 \
+                -H "Authorization: Bearer ***" \
+                "http://127.0.0.1:8090/api/v1/auth/machine-identities" 2>/dev/null \
+                | jq -r '.machineIdentities[]? | select(.name=="agent-default") | .id // empty' \
+                2>/dev/null | head -1 || true)
+        fi
+        if [ -z "$agent_mi_id" ]; then
+            log_warn "Could not create or find agent-default machine identity (HTTP $agent_mi_resp); infisical-mcp will fail at startup"
+            log_warn "  Body: $(head -c 400 /tmp/infisical-agent-mi.json 2>/dev/null)"
+        else
+            log_success "Machine identity 'agent-default' id=${agent_mi_id}"
+
+            # Step 2: add universal-auth (POST .../{id}/universal-auth). May
+            # already exist on a re-run; if so the response will be a 4xx and
+            # we fall back to the existing clientId/clientSecret by inspecting
+            # the identity's auth methods (the universal-auth list endpoint
+            # shape is not stable across v0.166.x patch releases, so we just
+            # log and continue — the operator can manually rotate if needed).
+            local agent_ua_resp agent_client_id agent_client_secret
+            agent_ua_resp=$(curl -sS -o /tmp/infisical-agent-ua.json -w '%{http_code}' --max-time 30 \
+                -H 'Content-Type: application/json' \
+                -H "Authorization: Bearer ***" \
+                -X POST "http://127.0.0.1:8090/api/v1/auth/machine-identities/${agent_mi_id}/universal-auth" \
+                -d '{}' \
+                2>/dev/null || echo "000")
+            agent_client_id=$(jq -r '.clientId // empty' /tmp/infisical-agent-ua.json 2>/dev/null || true)
+            agent_client_secret=$(jq -r '.clientSecret // empty' /tmp/infisical-agent-ua.json 2>/dev/null || true)
+            if [ -z "$agent_client_id" ] || [ -z "$agent_client_secret" ]; then
+                log_warn "Agent universal-auth add did not return clientId/clientSecret (HTTP $agent_ua_resp)"
+                log_warn "  Body: $(head -c 400 /tmp/infisical-agent-ua.json 2>/dev/null)"
+                log_warn "  Re-rotate via the AdminLM Secrets page scope-policy UI"
+            else
+                log_success "Agent universal-auth client created"
+
+                # Step 3: exchange clientId/clientSecret for an access token.
+                local agent_login_resp
+                agent_login_resp=$(curl -sS -o /tmp/infisical-agent-login.json -w '%{http_code}' --max-time 30 \
+                    -H 'Content-Type: application/json' \
+                    -X POST "http://127.0.0.1:8090/api/v1/auth/machine-identities/${agent_mi_id}/universal-auth/login" \
+                    -d "{\"clientId\":\"${agent_client_id}\",\"clientSecret\":\"${agent_client_secret}\"}" \
+                    2>/dev/null || echo "000")
+                agent_token=$(jq -r '.accessToken // empty' /tmp/infisical-agent-login.json 2>/dev/null || true)
+                if [ -z "$agent_token" ]; then
+                    log_warn "Agent universal-auth login did not return accessToken (HTTP $agent_login_resp)"
+                    log_warn "  Body: $(head -c 400 /tmp/infisical-agent-login.json 2>/dev/null)"
+                else
+                    log_success "Agent access token acquired (lives in $agent_env)"
+
+                    # Step 4: grant Viewer role on the project. Per BACKLOG #94
+                    # v1.0 the agent has READ-ONLY access — same Viewer role as
+                    # the operator identity. Path-scoping is via the operator's
+                    # scope-policy UI; the v1.0 limitation is project-wide
+                    # Viewer (folder-scoped grants require custom roles that
+                    # aren't stable in v0.166.2 — tracked as v1.x follow-up).
+                    local agent_perm_resp
+                    agent_perm_resp=$(curl -sS -o /tmp/infisical-agent-perm.json -w '%{http_code}' --max-time 30 \
+                        -H 'Content-Type: application/json' \
+                        -H "Authorization: Bearer ***" \
+                        -X POST "http://127.0.0.1:8090/api/v1/project-machine-identities" \
+                        -d "{\"machineIdentityId\":\"${agent_mi_id}\",\"projectId\":\"${project_id}\",\"role\":\"viewer\",\"isTemporary\":false}" \
+                        2>/dev/null || echo "000")
+                    if [ "$agent_perm_resp" = "200" ]; then
+                        log_success "Granted viewer role on project ${project_id} (agent token is read-only)"
+                    else
+                        log_warn "Could not grant viewer role on project (HTTP $agent_perm_resp); token still valid but unconstrained"
+                        log_warn "  Body: $(head -c 400 /tmp/infisical-agent-perm.json 2>/dev/null)"
+                    fi
+                fi
+            fi
+        fi
+    fi
+
+    # ------------------------------------------------------------------
+    # 7) Persist operator + agent creds to ~/.hermes/secrets/.
+    #    Operator env: ~/.hermes/secrets/infisical-operator.env (chmod 600).
+    #    Agent env:    ~/.hermes/secrets/infisical-agent.env    (chmod 600).
+    #    SEPARATE files enforce least-privilege separation of concerns —
+    #    operator token grants Streamlit full path-scope CRUD; agent token
+    #    grants infisical-mcp read-only access.
     # ------------------------------------------------------------------
     local pg_pw redis_pw auth_secret enc_key
     pg_pw=$(grep '^POSTGRES_PASSWORD=' "$env_file" | head -1 | cut -d= -f2-)
@@ -2519,6 +2635,142 @@ EOF
     log_info "  Project ID:   ${project_id:-<lookup on next run>}"
     log_info "  Admin email:  ${admin_email}"
     log_info "  UI URL:       http://127.0.0.1:8090 (operator-only, loopback binding in docker-compose.yml)"
+
+    # ------------------------------------------------------------------
+    # 7b) Write the AGENT env file (~/.hermes/secrets/infisical-agent.env).
+    #     chmod 600. Read by install_infisical_mcp() to compose-up
+    #     infisical-mcp with the right access token. SEPARATE file from
+    #     the operator env so a leaked operator token can't be reused
+    #     against the agent's read-only scope (and vice-versa).
+    # ------------------------------------------------------------------
+    cat > "$agent_env" <<EOF
+# Generated by bootstrap.sh deploy_infisical_stack() on $(date -u +%Y-%m-%dT%H:%M:%SZ)
+# BACKLOG #94 Phase 5 — agent-default machine-identity creds for infisical-mcp.
+# chmod 600; readable only by the operator user (typically ansible).
+# This is the AGENT token (viewer role, used by infisical-mcp). The operator
+# token (full CRUD via Streamlit) lives in infisical-operator.env — NEVER
+# mix the two.
+
+INFISICAL_PROJECT_ID=${project_id}
+INFISICAL_AGENT_TOKEN=${agent_token}
+
+# --- Idempotency gate for re-runs (skips the 4-step identity-bootstrap
+#     sequence if the env file already has a working token) ---
+INFISICAL_AGENT_BOOTSTRAP_DONE=true
+EOF
+    chmod 600 "$agent_env"
+    log_success "Wrote Infisical agent creds to $agent_env (chmod 600)"
+    if [ -n "$agent_token" ]; then
+        log_info "  Agent token:  set (length=${#agent_token})"
+    else
+        log_warn "  Agent token:  EMPTY — infisical-mcp will fail until step 6c completes successfully on a re-run"
+    fi
+}
+
+# ============================================
+# Install Infisical MCP (infisical-mcp)
+# ============================================
+#
+# BACKLOG #94 Phase 5 — deploy the read-only infisical-mcp FastMCP server
+# and wire it into the it_admin Hermes profile. Mirrors deploy_kb_stack()
+# + register_kb_mcp() but for the Phase 5 Infisical consumer:
+#
+#   1. Create /home/ansible/.hermes/logs/adminlm-infisical-mcp (Loki log
+#      target — alloy tails this directory; the bind mount in
+#      infisical-mcp/docker-compose.yml is into this exact path).
+#   2. docker compose up -d --build against infisical-mcp/docker-compose.yml.
+#      Sources ~/.hermes/secrets/infisical-agent.env so compose expandenv
+#      resolves INFISICAL_AGENT_TOKEN + INFISICAL_PROJECT_ID at up time.
+#   3. Wait for the /health endpoint to return 200 (up to 30s).
+#   4. Register infisical-mcp in the it_admin profile via the standalone
+#      register_infisical_mcp.sh script (idempotent).
+#
+# Idempotency: docker compose up -d is naturally idempotent. Re-runs
+# skip unchanged services and only restart containers whose env / volumes
+# / healthcheck changed. The Loki log dir creation is a no-op on re-run
+# (mkdir -p). The register script is idempotent.
+
+install_infisical_mcp() {
+    # INFRA_DIR is set once in main() upfront.
+    local infra_dir="${INFRA_DIR:?INFRA_DIR not set — main() must clone repo first}"
+    local mcp_dir="$infra_dir/infisical-mcp"
+    local compose_file="$mcp_dir/docker-compose.yml"
+
+    if [ ! -f "$compose_file" ]; then
+        log_warn "infisical-mcp/docker-compose.yml not found at $compose_file; skipping"
+        return 0
+    fi
+
+    # 1) Ensure the Loki audit log directory exists on the host.
+    local mcp_log_dir="/home/ansible/.hermes/logs/adminlm-infisical-mcp"
+    if [ ! -d "$mcp_log_dir" ]; then
+        log_info "Creating Loki log dir for infisical-mcp: $mcp_log_dir"
+        mkdir -p "$mcp_log_dir"
+        chmod 777 "$mcp_log_dir" 2>/dev/null || sudo chmod 777 "$mcp_log_dir" || true
+    fi
+
+    # 2) Source the agent env file so compose expandenv resolves
+    #    INFISICAL_AGENT_TOKEN / INFISICAL_PROJECT_ID before the
+    #    container starts. Same pattern as deploy_streamlit_ui_stack()
+    #    sourcing the operator env file.
+    local agent_env="$HERMES_HOME/secrets/infisical-agent.env"
+    if [ -f "$agent_env" ]; then
+        # shellcheck disable=SC1090
+        set -a; source "$agent_env"; set +a
+        log_info "Sourced Infisical agent env ($agent_env) for infisical-mcp container"
+        if [ -z "${INFISICAL_AGENT_TOKEN:-}" ]; then
+            log_warn "INFISICAL_AGENT_TOKEN is empty in $agent_env - infisical-mcp will fail every API call"
+            log_warn "  Re-run: bootstrap.sh deploy_infisical_stack to (re-)generate the agent identity"
+        fi
+    else
+        log_warn "Infisical agent env not found at $agent_env; infisical-mcp will start but every call will fail"
+        log_warn "  Run: bootstrap.sh deploy_infisical_stack to provision"
+    fi
+
+    # Also export INFISICAL_URL (defaults to http://infisical:8090 from
+    # the compose file). Operator can override at bootstrap time via the
+    # INFISICAL_URL env var.
+    if [ -z "${INFISICAL_URL:-}" ]; then
+        export INFISICAL_URL="http://infisical:8090"
+    fi
+
+    # 3) docker compose up. --build ensures the image is rebuilt when
+    #    server.py / Dockerfile change; on re-runs with no source
+    #    changes this is a fast cache-hit no-op.
+    log_info "Deploying infisical-mcp (BACKLOG #94 Phase 5 - read-only agent consumer)..."
+    if sg docker -c "docker compose -f '$compose_file' up -d --build" 2>&1 | tail -10; then
+        log_success "infisical-mcp deployed (port 8003, loopback-only)"
+    else
+        log_warn "infisical-mcp deployment failed; continuing"
+        return 0
+    fi
+
+    # 4) Wait for /health to return 200 (up to 30s).
+    log_info "Waiting for infisical-mcp /health (up to 30s)..."
+    local health_code
+    local i
+    for i in $(seq 1 6); do
+        health_code=$(curl -sS -o /dev/null --max-time 3 -w '%{http_code}' \
+            http://127.0.0.1:8003/health 2>/dev/null || echo "000")
+        if [ "$health_code" = "200" ]; then
+            log_success "infisical-mcp /health: HTTP 200 (after ~$((i * 5))s)"
+            break
+        fi
+        sleep 5
+    done
+    if [ "$health_code" != "200" ]; then
+        log_warn "infisical-mcp /health: HTTP $health_code after 30s - verify_installation will flag this"
+    fi
+
+    # 5) Register infisical-mcp in the it_admin profile via the
+    #    standalone script (idempotent - safe to re-run).
+    if [ -x "$mcp_dir/register_infisical_mcp.sh" ]; then
+        log_info "Registering infisical-mcp in it_admin profile..."
+        bash "$mcp_dir/register_infisical_mcp.sh" it_admin || \
+            log_warn "register_infisical_mcp.sh returned non-zero - profile registration may need a manual retry"
+    else
+        log_warn "register_infisical_mcp.sh not executable at $mcp_dir/register_infisical_mcp.sh; skipping profile registration"
+    fi
 }
 
 # ============================================
@@ -3029,6 +3281,7 @@ print_access_summary() {
     echo "     Inventory MCP: http://localhost:8001/mcp"
     echo "     KB MCP:        http://localhost:8002/mcp"
     echo "     Grafana MCP:   http://localhost:8000/mcp"
+    echo "     Infisical MCP: http://localhost:8003/mcp  (read-only agent consumer)"
     echo ""
     echo "  📝 Verify the LLM is working:"
     echo "     hermes chat -q \"hello!\""
@@ -3183,6 +3436,14 @@ verify_installation() {
                     ;;
             esac
         fi
+        # BACKLOG #94 Phase 5 - infisical-mcp (read-only agent consumer).
+        # /health returns 200 with a small JSON envelope once the FastMCP
+        # transport is up (see infisical-mcp/server.py _health route). It
+        # intentionally does NOT verify Infisical reachability - that's
+        # deferred to the first real MCP call so a transient Infisical
+        # outage doesn't crash-loop this container. Bound to 127.0.0.1:8003
+        # (loopback only, matches the docker-compose.yml port mapping).
+        verify_service_health "Infisical MCP"   "http://localhost:8003/health"              "200"    || errors=$((errors+1))
         verify_service_health "Hermes Dashboard" "http://localhost:$HERMES_PORT/"          "302"    || errors=$((errors+1))
         # BACKLOG #66 — streamlit + the customer-facing services that PR #41
         # folded into the default install. Also probe the Hermes API server
@@ -3410,6 +3671,15 @@ main() {
     # Phase 5, backup integration Phase 9) have a live vault to talk to.
     # Bound to 127.0.0.1:8090 — operator-only, customer never reaches the UI.
     deploy_infisical_stack
+
+    # BACKLOG #94 Phase 5: deploy infisical-mcp (read-only agent consumer).
+    # Must run AFTER deploy_infisical_stack (so the agent-default machine
+    # identity token exists in ~/.hermes/secrets/infisical-agent.env) and
+    # BEFORE verify_installation() at the end of main() (so the MCP is up
+    # when the verify check probes /health). install_infisical_mcp() also
+    # registers infisical-mcp in the it_admin profile via the standalone
+    # register_infisical_mcp.sh script.
+    install_infisical_mcp
 
     # BACKLOG #30 K2: deploy the kb-mcp knowledge-base server and wire it
     # into both default and it_admin profiles. kb-mcp is the SQLite/FTS5

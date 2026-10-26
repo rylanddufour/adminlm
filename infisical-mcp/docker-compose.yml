@@ -1,0 +1,126 @@
+# BACKLOG #94 Phase 5 — infisical-mcp (READ-ONLY agent consumer).
+#
+# Single FastMCP container that exposes three read-only Infisical tools
+# (get_secret, list_paths, list_systems) to the it_admin Hermes profile.
+# Mirror of inventory-stack/docker-compose.yml and streamlit-ui-stack/
+# docker-compose.yml — same monitoring + infisical external networks,
+# same Loki log bind-mount convention so alloy picks up audit events.
+#
+# Bind: 127.0.0.1:8003 — loopback only. The customer's network cannot
+# reach this port. The it_admin profile (host-local Hermes) is the
+# only caller. Matches BACKLOG #58 DROPPED decision (no reverse-proxy
+# exposure) — the agent calls infisical-mcp from the AdminLM host via
+# the localhost loopback, never over a customer-routable address.
+#
+# Networks: shared `monitoring` (so alloy can also reach the audit logs
+# via the loki source) and shared `infisical` (so this container can
+# reach `infisical:8090` by container name). Both are declared external
+# because they were created by the main stack / infisical-stack deploy.
+#
+# Auth: INFISICAL_AGENT_TOKEN. bootstrap.sh deploy_infisical_stack()
+# step 6c (Phase 5) creates the agent-default machine identity and
+# writes its access token to ~/.hermes/secrets/infisical-agent.env
+# (chmod 600). bootstrap.sh install_infisical_mcp() sources that env
+# file at `up -d` time so compose expandenv resolves ${INFISICAL_AGENT_TOKEN}
+# before the container starts. Same pattern as streamlit-ui sourcing
+# the operator env file for INFISICAL_OPERATOR_TOKEN.
+
+services:
+  infisical-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: adminlm_infisical-mcp
+    container_name: infisical-mcp
+    # Loopback-only per BACKLOG #58. Inventory-mcp and kb-mcp use the
+    # same pattern on 8001/8002; we get 8003.
+    ports:
+      - "127.0.0.1:8003:8003"
+    networks:
+      - monitoring
+      - infisical
+    volumes:
+      # Loki audit logs. alloy (config/alloy.yml adminlm_infisical_mcp
+      # block) tails /var/lib/hermes/logs/adminlm-infisical-mcp/*.log
+      # INSIDE the alloy container — which is bind-mounted from this host
+      # path via ${HOME}/.hermes/logs:/var/lib/hermes/logs in
+      # docker-compose.yml (alloy service). Same pattern as inventory-mcp
+      # + kb-mcp — bind-mount the host directory so the container can
+      # write there as root (python:3.12-slim defaults to uid 0) without
+      # exposing the operator's other logs. The host directory must
+      # pre-exist with write permission for the container; bootstrap.sh
+      # install_infisical_mcp() creates it.
+      - /home/ansible/.hermes/logs/adminlm-infisical-mcp:/home/ansible/.hermes/logs/adminlm-infisical-mcp:rw
+      # loki_logger.py is the shared log-shipper module from
+      # adminlm-ansible-stack. streamlit-ui-stack uses the same bind-mount
+      # pattern with a PYTHONPATH injection — the loki_logger.py inside
+      # the streamlit-app dir is a SYMLINK that doesn't resolve across
+      # the bind-mount boundary, so we mount the file directly and add
+      # the parent dir to PYTHONPATH. Same here.
+      - ../adminlm-ansible-stack/loki_logger.py:/app/adminlm-ansible-stack/loki_logger.py:ro
+      # Source bind-mount for live reload during dev. Mirrors inventory-mcp
+      # / kb-mcp — Python module on disk at /app/server.py so editing the
+      # file live-reloads without a rebuild (the container doesn't have
+      # auto-reload on, but at least the file is editable in place).
+      - ./server.py:/app/server.py:ro
+    environment:
+      # ---- Infisical connection (BACKLOG #94 Phase 5) ----
+      # INFISICAL_URL points at the `infisical` container on the shared
+      # `infisical` Docker network (see networks: below). Default is the
+      # loopback-only 8090 port — the MCP talks to infisical over the
+      # docker network, not the host loopback.
+      - INFISICAL_URL=${INFISICAL_URL:-http://infisical:8090}
+      - INFISICAL_PROJECT_ID=${INFISICAL_PROJECT_ID:-}
+      # INFISICAL_AGENT_TOKEN is the agent-default machine-identity
+      # access token, NOT the operator token. Created by bootstrap.sh
+      # deploy_infisical_stack() step 6c. Strict least-privilege:
+      # operator token (INFISICAL_OPERATOR_TOKEN) stays in streamlit-ui;
+      # agent token (INFISICAL_AGENT_TOKEN) stays here. The agent cannot
+      # mutate the vault under any circumstance — the MCP exposes no
+      # write tools AND its token has no write grants.
+      - INFISICAL_AGENT_TOKEN=${INFISICAL_AGENT_TOKEN:-}
+      # INFISICAL_ENVIRONMENT defaults to "prod" — the only environment
+      # created by deploy_infisical_stack() step 6. Multi-env is
+      # explicitly out of scope per BACKLOG #94 v1.0.
+      - INFISICAL_ENVIRONMENT=${INFISICAL_ENVIRONMENT:-prod}
+      # Default path prefix for list_paths / list_systems. Operators
+      # typically pass an explicit prefix per call, but the default
+      # covers the common "scan the customer IT subtree" case.
+      - INFISICAL_PATH_PREFIX=${INFISICAL_PATH_PREFIX:-/adminlm/it-systems/}
+      # Static operator label for the loki audit events. MCP doesn't
+      # carry per-call user context (the tool is invoked by the agent,
+      # not a named human) but the audit row benefits from a stable
+      # user_id for grouping in Grafana.
+      - INFISICAL_MCP_AUDIT_USER_ID=${INFISICAL_MCP_AUDIT_USER_ID:-agent-it_admin}
+      # ---- loki_logger output dir ----
+      # alloy tails /var/lib/hermes/logs/adminlm-infisical-mcp/*.log
+      # inside its own container (see config/alloy.yml — the
+      # adminlm_infisical_mcp block added in this PR); that path resolves
+      # to this bind mount source via the alloy service's
+      # ${HOME}/.hermes/logs:/var/lib/hermes/logs:ro mount. The
+      # container's loki_logger writes NDJSON to this dir; alloy pushes
+      # to Loki with labels {job="adminlm-infisical-mcp", source="adminlm_host"}.
+      - LOKI_LOG_DIR=/home/ansible/.hermes/logs/adminlm-infisical-mcp
+      # ---- PYTHONPATH for the bind-mounted loki_logger.py ----
+      # See volumes: above. loki_logger.py is mounted at
+      # /app/adminlm-ansible-stack/loki_logger.py and this PYTHONPATH
+      # entry lets `from loki_logger import log_event` resolve.
+      - PYTHONPATH=/app/adminlm-ansible-stack
+    healthcheck:
+      # /health returns 200 with a small JSON envelope (see server.py
+      # _health route). The endpoint intentionally does NOT verify
+      # Infisical reachability — that's deferred to the first real MCP
+      # call so a transient Infisical outage doesn't crash-loop this
+      # container (it should still be "up" from the orchestrator's POV).
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8003/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+
+networks:
+  monitoring:
+    external: true
+  infisical:
+    external: true
