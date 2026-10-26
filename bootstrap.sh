@@ -2367,6 +2367,120 @@ EOF
     fi
 
     # ------------------------------------------------------------------
+    # 6b) Generate the operator read-only machine identity (BACKLOG #94
+    #     Phase 3 — Secrets page). The operator token is what the
+    #     streamlit-ui container passes into INFISICAL_OPERATOR_TOKEN; it
+    #     authenticates the Secrets page's /api/v3/secrets/* calls.
+    #
+    #     Sequence (Infisical v0.166.2 v1 API):
+    #       1. POST /api/v1/auth/machine-identities        → { id }
+    #       2. POST /api/v1/auth/machine-identities/{id}/universal-auth
+    #                                                    → { clientId, clientSecret }
+    #       3. POST /api/v1/auth/machine-identities/{id}/universal-auth/login
+    #                                                    → { accessToken } (bearer)
+    #       4. POST /api/v1/project-machine-identities    → grant Viewer role on the
+    #                                                      'production' project (read-only)
+    #
+    #     Idempotency: skip if INFISICAL_OPERATOR_TOKEN already exists in
+    #     the operator env file (set by a prior run — re-runs MUST NOT
+    #     invalidate the Streamlit page's working token).
+    #
+    #     Phase 3 simplification: we store the ACCESS TOKEN (returned
+    #     from step 3) directly, not the universal-auth clientId/Secret.
+    #     Access tokens expire (~24h default); the operator env file
+    #     rotates them by re-running bootstrap. A later phase can add a
+    #     refresh-token flow; for now, refresh = re-run bootstrap.
+    # ------------------------------------------------------------------
+    local operator_token=""
+    if grep -q '^INFISICAL_OPERATOR_TOKEN=' "$operator_env" 2>/dev/null; then
+        operator_token=$(grep '^INFISICAL_OPERATOR_TOKEN=' "$operator_env" | head -1 | cut -d= -f2-)
+        if [ -n "$operator_token" ]; then
+            log_success "INFISICAL_OPERATOR_TOKEN already set in $operator_env; skipping machine-identity generation"
+        fi
+    fi
+
+    if [ -z "$operator_token" ] && [ -n "$identity_token" ] && [ -n "$project_id" ]; then
+        log_info "Generating read-only operator machine identity for the Streamlit Secrets page..."
+
+        # Step 1: create machine identity (org-level)
+        local mi_resp mi_id
+        mi_resp=$(curl -sS -o /tmp/infisical-mi.json -w '%{http_code}' --max-time 30 \
+            -H 'Content-Type: application/json' \
+            -H "Authorization: Bearer ***" \
+            -X POST "http://127.0.0.1:8090/api/v1/auth/machine-identities" \
+            -d '{"name":"streamlit-operator","description":"Read-only operator identity for the AdminLM Secrets page (BACKLOG #94 Phase 3)"}' \
+            2>/dev/null || echo "000")
+        mi_id=$(jq -r '.machineIdentity.id // empty' /tmp/infisical-mi.json 2>/dev/null || true)
+        if [ -z "$mi_id" ]; then
+            # Maybe the identity already exists (re-run). Try to look it up.
+            log_info "Machine identity create did not return id (HTTP $mi_resp) — looking up by name..."
+            mi_id=$(curl -sS --max-time 15 \
+                -H "Authorization: Bearer ***" \
+                "http://127.0.0.1:8090/api/v1/auth/machine-identities" 2>/dev/null \
+                | jq -r '.machineIdentities[]? | select(.name=="streamlit-operator") | .id // empty' \
+                2>/dev/null | head -1 || true)
+        fi
+        if [ -z "$mi_id" ]; then
+            log_warn "Could not create or find machine identity (HTTP $mi_resp); Secrets page will show 'token not initialized'"
+            log_warn "  Body: $(head -c 400 /tmp/infisical-mi.json 2>/dev/null)"
+        else
+            log_success "Machine identity 'streamlit-operator' id=${mi_id}"
+
+            # Step 2: add a universal auth client to the identity (one-time).
+            local ua_resp client_id client_secret
+            ua_resp=$(curl -sS -o /tmp/infisical-ua.json -w '%{http_code}' --max-time 30 \
+                -H 'Content-Type: application/json' \
+                -H "Authorization: Bearer ***" \
+                -X POST "http://127.0.0.1:8090/api/v1/auth/machine-identities/${mi_id}/universal-auth" \
+                -d '{}' \
+                2>/dev/null || echo "000")
+            client_id=$(jq -r '.clientId // empty' /tmp/infisical-ua.json 2>/dev/null || true)
+            client_secret=$(jq -r '.clientSecret // empty' /tmp/infisical-ua.json 2>/dev/null || true)
+            if [ -z "$client_id" ] || [ -z "$client_secret" ]; then
+                log_warn "Universal-auth add did not return clientId/clientSecret (HTTP $ua_resp)"
+                log_warn "  Body: $(head -c 400 /tmp/infisical-ua.json 2>/dev/null)"
+            else
+                log_success "Universal-auth client created"
+
+                # Step 3: exchange clientId/clientSecret for an access token.
+                local login_resp
+                login_resp=$(curl -sS -o /tmp/infisical-login.json -w '%{http_code}' --max-time 30 \
+                    -H 'Content-Type: application/json' \
+                    -X POST "http://127.0.0.1:8090/api/v1/auth/machine-identities/${mi_id}/universal-auth/login" \
+                    -d "{\"clientId\":\"${client_id}\",\"clientSecret\":\"${client_secret}\"}" \
+                    2>/dev/null || echo "000")
+                operator_token=$(jq -r '.accessToken // empty' /tmp/infisical-login.json 2>/dev/null || true)
+                if [ -z "$operator_token" ]; then
+                    log_warn "Universal-auth login did not return accessToken (HTTP $login_resp)"
+                    log_warn "  Body: $(head -c 400 /tmp/infisical-login.json 2>/dev/null)"
+                else
+                    log_success "Operator access token acquired (lives in $operator_env)"
+
+                    # Step 4: grant Viewer role on the project (read-only).
+                    # The Infisical role name 'viewer' maps to read-only at the
+                    # project level. If the endpoint shape differs on v0.166.2
+                    # (it has shifted between minor versions), we log a warn
+                    # but keep the token — the operator can still auth, just
+                    # with org-level visibility rather than per-project.
+                    local perm_resp
+                    perm_resp=$(curl -sS -o /tmp/infisical-perm.json -w '%{http_code}' --max-time 30 \
+                        -H 'Content-Type: application/json' \
+                        -H "Authorization: Bearer ***" \
+                        -X POST "http://127.0.0.1:8090/api/v1/project-machine-identities" \
+                        -d "{\"machineIdentityId\":\"${mi_id}\",\"projectId\":\"${project_id}\",\"role\":\"viewer\",\"isTemporary\":false}" \
+                        2>/dev/null || echo "000")
+                    if [ "$perm_resp" = "200" ]; then
+                        log_success "Granted viewer role on project ${project_id}"
+                    else
+                        log_warn "Could not grant viewer role on project (HTTP $perm_resp); token still valid but unconstrained"
+                        log_warn "  Body: $(head -c 400 /tmp/infisical-perm.json 2>/dev/null)"
+                    fi
+                fi
+            fi
+        fi
+    fi
+
+    # ------------------------------------------------------------------
     # 7) Persist operator creds to ~/.hermes/secrets/infisical-operator.env.
     #    This file is what downstream phases (Streamlit secrets page, mcp,
     #    backup integration) will read from. chmod 600 — never group/world.
@@ -2394,6 +2508,7 @@ INFISICAL_ADMIN_PASSWORD=${admin_pw}
 INFISICAL_ORG_ID=${org_id}
 INFISICAL_PROJECT_ID=${project_id}
 INFISICAL_ADMIN_TOKEN=${identity_token}
+INFISICAL_OPERATOR_TOKEN=${operator_token}
 
 # --- Idempotency gate for re-runs ---
 INFISICAL_BOOTSTRAP_DONE=true
@@ -2575,6 +2690,25 @@ deploy_streamlit_ui_stack() {
     fi
 
     log_info "Deploying streamlit-ui (Cards 3-6 — customer Streamlit UI)..."
+
+    # ---- BACKLOG #94 Phase 3 — Secrets page wiring ----
+    # The streamlit-ui container receives the operator token via
+    # ${INFISICAL_OPERATOR_TOKEN:-} substitution. Compose's expandenv
+    # runs at `up -d` time, so we MUST have INFISICAL_OPERATOR_TOKEN
+    # (and INFISICAL_PROJECT_ID, INFISICAL_URL) in this shell's env
+    # BEFORE invoking docker compose. Source the operator env file
+    # generated by deploy_infisical_stack() so the page can call
+    # /api/v3/secrets/raw. Same pattern as HERMES_API_KEY
+    # (provision_api_server_key() at the top of main()).
+    local operator_env="$HERMES_HOME/secrets/infisical-operator.env"
+    if [ -f "$operator_env" ]; then
+        # shellcheck disable=SC1090
+        set -a; source "$operator_env"; set +a
+        log_info "Sourced Infisical operator env ($operator_env) for streamlit-ui container"
+    else
+        log_warn "Infisical operator env not found at $operator_env; Secrets page will show 'not initialized'"
+        log_warn "  Run: bootstrap.sh deploy_infisical_stack to provision"
+    fi
 
     # streamlit-ui depends on adminlm-ansible-runner being up (HMAC-signed
     # POSTs to it from the Run Playbook page). Docker Compose's

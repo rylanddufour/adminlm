@@ -38,7 +38,8 @@ streamlit-ui-stack/
     ├── settings.py             # load URLs + customer name from env
     └── pages/
         ├── 1_Settings.py       # read-only config + health subsection
-        └── 2_Health.py         # per-backend /health probe
+        ├── 2_Secrets.py        # BACKLOG #94 Phase 3 — read-only Infisical vault viewer
+        └── 3_Run_Playbook.py   # Card 4 — HMAC-signed ansible run
 ```
 
 ## Bring it up
@@ -130,6 +131,15 @@ curl -s -G http://localhost:3100/loki/api/v1/query \
 - ⏭️ Card 5: Agent Chat page (Hermes `/v1/responses` chat).
 - ⏭️ Card 6: KB Search + Inventory Search pages.
 - ⏭️ Card 7: `docker-compose.v1-private.yml` overlay + bootstrap integration.
+
+### BACKLOG #94 Phase 3 — Secrets page
+
+- Secrets page (`/Secrets` on :8501) — operator-facing read-only view of the
+  Infisical vault (BACKLOG #94 Phase 3). The page lists secrets under
+  `/adminlm/it-systems/` and supports click-to-reveal with Loki audit logging.
+  The Infisical UI itself stays bound to `127.0.0.1:8090`; the operator token is
+  provisioned by `bootstrap.sh deploy_infisical_stack()` and lives in
+  `~/.hermes/secrets/infisical-operator.env`.
 
 ## Card status
 
