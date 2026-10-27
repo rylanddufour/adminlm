@@ -8,7 +8,7 @@
 #
 # Phase 3 (read-only MVP, committed aa44947):
 #   - Secret list under configurable path prefix (default /adminlm/it-systems/)
-#   - System-name filter from /api/v3/folders
+#   - System-name filter from /api/v1/folders
 #   - Click-row to reveal value with st.toggle
 #   - GET /api/v3/secrets/* only — NO writes
 #
@@ -233,7 +233,7 @@ def _list_secrets(path: str) -> list[dict]:
 def _list_subfolders(path: str) -> list[dict]:
     """List immediate subfolders of `path`. Used to populate the system filter.
 
-    Endpoint: GET /api/v3/folders?workspaceId=...&environment=...&path=...
+    Endpoint: GET /api/v1/folders?workspaceId=...&environment=...&path=...
     Returns: list of {id, name, path, ...}
     """
     base = _infisical_url().rstrip("/")
@@ -243,7 +243,7 @@ def _list_subfolders(path: str) -> list[dict]:
         "environment": INFISICAL_ENV_SLUG,
         "path": path,
     }
-    url = f"{base}/api/v3/folders?{urlencode(params)}"
+    url = f"{base}/api/v1/folders?{urlencode(params)}"
     headers = {"Authorization": f"Bearer {_operator_token()}"}
     resp = httpx.get(url, headers=headers, timeout=_API_TIMEOUT_S)
     resp.raise_for_status()
@@ -556,7 +556,7 @@ path_prefix = st.text_input(
          "will restrict this; Phase 3 lets the operator change it freely.",
 )
 
-# System name filter — fetched from /api/v3/folders on every path change.
+# System name filter — fetched from /api/v1/folders on every path change.
 # Cached for the lifetime of the session_state for this prefix so a
 # list/secrets reload doesn't re-hit the API.
 folders: list[dict] = []
