@@ -293,7 +293,9 @@ def _read_secret(path: str, secret_key: str) -> dict:
 #          (no body) → enable universal-auth on the identity
 #   POST   /api/v1/auth/universal-auth/identities/{id}/client-secrets
 #          body: {"description": "...", "numUsesLimit": 0, "ttl": 0}
-#          → {clientSecret, clientSecretData: {identityUAId: clientId}}
+#          → {clientSecret, clientSecretData: {...}}  (clientSecret value here)
+#   GET    /api/v1/auth/universal-auth/identities/{id}
+#          → {identityUniversalAuth: {id, clientId, ...}}  (login clientId here)
 #   POST   /api/v1/auth/universal-auth/login
 #          body: {"clientId": "...", "clientSecret": "..."}
 #          → {accessToken, tokenType, expiresIn}
@@ -377,30 +379,47 @@ def _add_universal_auth(mi_id: str) -> tuple[str, str]:
 
     Returns (client_id, client_secret). Empty strings on failure.
     One-time per identity creation; rotate = call this again (replaces).
+
+    v0.166.2 wiring:
+      - POST /api/v1/auth/universal-auth/identities/{id}/client-secrets
+        returns {clientSecret, clientSecretData: {...}}. The clientSecret
+        value goes straight into the login body.
+      - GET  /api/v1/auth/universal-auth/identities/{id}
+        returns {identityUniversalAuth: {clientId, id, identityId, ...}}.
+        The clientId (a server-generated UUID stored on the
+        identity_universal_auths.clientId column) is what login's
+        identityUaDAL.findOne({clientId}) actually looks up.
+        The client-secrets response does NOT contain it (its .id and
+        .identityUAId are PKs of OTHER tables).
     """
     base = _infisical_url().rstrip("/")
-    # v0.166.2: POST /api/v1/auth/universal-auth/identities/{id}/client-secrets
-    # → {clientSecret, clientSecretData: {identityUAId, id, ...}}.
-    # The clientId used at login is clientSecretData.identityUAId (the
-    # identity_universal_auth row's PK) — NOT clientSecretData.id (which
-    # is THIS client_secret row's PK; login's findOne({clientId}) looks
-    # up the identityUa, not the secret).
-    url = f"{base}/api/v1/auth/universal-auth/identities/{mi_id}/client-secrets"
-    payload = {"description": "AdminLM agent client secret", "numUsesLimit": 0, "ttl": 0}
-    resp = httpx.post(
-        url,
+
+    # 1) Create the client secret. Capture the value (not the clientId).
+    cs_url = f"{base}/api/v1/auth/universal-auth/identities/{mi_id}/client-secrets"
+    cs_payload = {"description": "AdminLM agent client secret", "numUsesLimit": 0, "ttl": 0}
+    cs_resp = httpx.post(
+        cs_url,
         headers={**_admin_headers(), "Content-Type": "application/json"},
-        json=payload,
+        json=cs_payload,
         timeout=_API_TIMEOUT_S,
     )
-    resp.raise_for_status()
-    body = resp.json()
-    if isinstance(body, dict):
-        data = body.get("clientSecretData") or {}
-        # clientId = identityUAId (NOT .id — that is the client_secret row's PK).
-        client_id = data.get("identityUAId") if isinstance(data, dict) else None
-        return client_id or "", body.get("clientSecret") or ""
-    return "", ""
+    cs_resp.raise_for_status()
+    cs_body = cs_resp.json()
+    client_secret = (cs_body or {}).get("clientSecret", "")
+
+    # 2) Fetch the identityUA's clientId (the login clientId). This MUST
+    # come from the GET response, not from the POST response.
+    ua_url = f"{base}/api/v1/auth/universal-auth/identities/{mi_id}"
+    ua_resp = httpx.get(ua_url, headers=_admin_headers(), timeout=_API_TIMEOUT_S)
+    ua_resp.raise_for_status()
+    ua_body = ua_resp.json()
+    client_id = ""
+    if isinstance(ua_body, dict):
+        iua = ua_body.get("identityUniversalAuth") or {}
+        if isinstance(iua, dict):
+            client_id = iua.get("clientId", "") or ""
+
+    return client_id, client_secret
 
 
 def _exchange_for_token(mi_id: str, client_id: str, client_secret: str) -> str:
