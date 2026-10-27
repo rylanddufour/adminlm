@@ -409,6 +409,13 @@ check_prerequisites() {
     # commit 026fd64 because the underlying issue was using a stripped-down
     # GitHub-raw installer that doesn't manage Node; the proper fix is to
     # delegate Node management to the docs-site installer.
+    #
+    # The docs-site installer only ships Node when the docs site is being
+    # installed — an optional path. ensure_node_22() is the fallback that
+    # runs after install_hermes() and pulls Node 22 directly from
+    # nodejs.org if the docs-site installer didn't. Idempotent — no-op
+    # when Node 22+ is already present. Hit on .220 BACKLOG #94 row #96
+    # live E2E (2026-10-27).
 
     log_success "Prerequisites check complete"
 }
@@ -484,6 +491,67 @@ install_docker_compose() {
     sudo chmod +x /usr/local/bin/docker-compose
 
     log_success "Docker Compose installed"
+}
+
+# ============================================
+# Node 22 fallback installer
+# ============================================
+# The docs-site installer (called from install_hermes, below) ships
+# Node to $HERMES_HOME/node/bin/, but only when the docs site is
+# actually being installed — an optional path. For a fresh-VM
+# bootstrap without the docs site, $HERMES_HOME/node/bin/ stays
+# empty and build_dashboard_ui falls back to apt's node 18, which
+# fails web/package.json's `engines: ">=22.22.0"` constraint. Hit
+# on .220 during BACKLOG #94 row #96 live E2E (2026-10-27).
+#
+# ensure_node_22 closes that gap: if Node 22+ is not present at
+# $HERMES_HOME/node/bin/node, install it from the upstream tarball.
+# Idempotent — re-runs are no-ops once Node 22 is in place.
+ensure_node_22() {
+    local node_bin="$HERMES_HOME/node/bin/node"
+    if [ -x "$node_bin" ]; then
+        local existing
+        existing="$("$node_bin" -v 2>/dev/null | sed 's/^v//')"
+        if [ -n "$existing" ] && [ "${existing%%.*}" -ge 22 ] 2>/dev/null; then
+            log_success "Node $existing already present at $node_bin (skipping)"
+            return 0
+        fi
+        log_info "Node $existing at $node_bin is below v22 — replacing"
+    fi
+
+    local ver="22.22.0"
+    local tar="node-v${ver}-linux-x64.tar.xz"
+    local url="https://nodejs.org/dist/v${ver}/${tar}"
+    local tmp
+    tmp="$(mktemp -d)"
+
+    log_info "Installing Node $ver from $url to $HERMES_HOME/node/"
+    if ! curl -fsSL "$url" -o "$tmp/$tar"; then
+        log_error "Failed to download $url — build_dashboard_ui may fail"
+        rm -rf "$tmp"
+        return 1
+    fi
+    if ! tar -xJf "$tmp/$tar" -C "$tmp"; then
+        log_error "Failed to extract $tar — install aborted"
+        rm -rf "$tmp"
+        return 1
+    fi
+
+    mkdir -p "$HERMES_HOME/node"
+    # cp -r ./target/. target  copies CONTENTS, not the directory itself,
+    # so $HERMES_HOME/node/bin etc. land at the same paths the docs-site
+    # installer would have used. Existing files are overwritten in place.
+    cp -r "$tmp/node-v${ver}-linux-x64/." "$HERMES_HOME/node/"
+    rm -rf "$tmp"
+
+    # Re-export PATH so the rest of this bootstrap sees the new node.
+    export PATH="$HERMES_HOME/node/bin:$PATH"
+
+    "$node_bin" -v >/dev/null 2>&1 || {
+        log_error "Smoke test failed for $node_bin"
+        return 1
+    }
+    log_success "Node $($node_bin -v) installed at $HERMES_HOME/node/"
 }
 
 # ============================================
@@ -3626,6 +3694,13 @@ main() {
     install_docker
     install_docker_compose
     install_hermes
+    # The docs-site installer that install_hermes invokes only ships
+    # Node 22 when the docs site is being installed (an optional path).
+    # For a fresh-VM bootstrap without the docs site, fall back to
+    # pulling Node 22 directly from nodejs.org so build_dashboard_ui
+    # (next) doesn't fail the Vite `engines` constraint on apt's
+    # node 18. Idempotent — no-op when Node 22 is already present.
+    ensure_node_22
 
     # Clone the infrastructure repo once, upfront, before anything else needs it.
     # This guarantees $INFRA_DIR is set for every downstream function regardless
