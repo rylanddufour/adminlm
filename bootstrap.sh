@@ -2370,26 +2370,27 @@ EOF
     # 6b) Generate the operator read-only machine identity (BACKLOG #94
     #     Phase 3 — Secrets page). The operator token is what the
     #     streamlit-ui container passes into INFISICAL_OPERATOR_TOKEN; it
-    #     authenticates the Secrets page's /api/v3/secrets/* calls.
+    #     authenticates the Secrets page's secret/list/read calls.
     #
-    #     Sequence (Infisical v0.166.2 v1 API):
-    #       1. POST /api/v1/auth/machine-identities        → { id }
-    #       2. POST /api/v1/auth/machine-identities/{id}/universal-auth
-    #                                                    → { clientId, clientSecret }
-    #       3. POST /api/v1/auth/machine-identities/{id}/universal-auth/login
-    #                                                    → { accessToken } (bearer)
-    #       4. POST /api/v1/project-machine-identities    → grant Viewer role on the
-    #                                                      'production' project (read-only)
+    #     Sequence (Infisical v0.166.2 — verified against the pinned
+    #     source tree; note there is NO /api/v1/auth/machine-identities
+    #     path in this version):
+    #       1. POST /api/v1/projects/{projectId}/identities
+    #          body: {name, roles:[{role:"viewer",isTemporary:false}]}
+    #          → creates project-scoped identity WITH viewer role in one call
+    #          → { identity: { id } }
+    #       2. POST /api/v1/auth/universal-auth/identities/{id}
+    #          (no body) → enables universal-auth on the identity
+    #       3. POST /api/v1/auth/universal-auth/identities/{id}/client-secrets
+    #          body: {description, numUsesLimit, ttl}
+    #          → { clientSecret, clientSecretData: { id: clientId } }
+    #       4. POST /api/v1/auth/universal-auth/login
+    #          body: {clientId, clientSecret}
+    #          → { accessToken, tokenType, expiresIn }
     #
     #     Idempotency: skip if INFISICAL_OPERATOR_TOKEN already exists in
     #     the operator env file (set by a prior run — re-runs MUST NOT
     #     invalidate the Streamlit page's working token).
-    #
-    #     Phase 3 simplification: we store the ACCESS TOKEN (returned
-    #     from step 3) directly, not the universal-auth clientId/Secret.
-    #     Access tokens expire (~24h default); the operator env file
-    #     rotates them by re-running bootstrap. A later phase can add a
-    #     refresh-token flow; for now, refresh = re-run bootstrap.
     # ------------------------------------------------------------------
     local operator_token=""
     if grep -q '^INFISICAL_OPERATOR_TOKEN=' "$operator_env" 2>/dev/null; then
@@ -2402,204 +2403,97 @@ EOF
     if [ -z "$operator_token" ] && [ -n "$identity_token" ] && [ -n "$project_id" ]; then
         log_info "Generating read-only operator machine identity for the Streamlit Secrets page..."
 
-        # Step 1: create machine identity (org-level)
+        # Step 1: create project-scoped identity WITH viewer role in one call.
+        # v0.166.2 POST /api/v1/projects/{pid}/identities = createProjectMachineIdentity:
+        # CREATES the identity in the project AND grants the role in one call
+        # (replaces the older 2-step org-create + project-role-grant pattern).
         local mi_resp mi_id
         mi_resp=$(curl -sS -o /tmp/infisical-mi.json -w '%{http_code}' --max-time 30 \
             -H 'Content-Type: application/json' \
-            -H "Authorization: Bearer ***" \
-            -X POST "http://127.0.0.1:8090/api/v1/auth/machine-identities" \
-            -d '{"name":"streamlit-operator","description":"Read-only operator identity for the AdminLM Secrets page (BACKLOG #94 Phase 3)"}' \
+            -H "Authorization: Bearer ${identity_token}" \
+            -X POST "http://127.0.0.1:8090/api/v1/projects/${project_id}/identities" \
+            -d "{\"name\":\"streamlit-operator\",\"roles\":[{\"role\":\"viewer\",\"isTemporary\":false}]}" \
             2>/dev/null || echo "000")
-        mi_id=$(jq -r '.machineIdentity.id // empty' /tmp/infisical-mi.json 2>/dev/null || true)
+        mi_id=$(jq -r '.identity.id // empty' /tmp/infisical-mi.json 2>/dev/null || true)
         if [ -z "$mi_id" ]; then
-            # Maybe the identity already exists (re-run). Try to look it up.
-            log_info "Machine identity create did not return id (HTTP $mi_resp) — looking up by name..."
+            # Maybe the identity already exists (re-run). Search by name.
+            log_info "Operator identity create did not return id (HTTP $mi_resp) — looking up by name..."
             mi_id=$(curl -sS --max-time 15 \
-                -H "Authorization: Bearer ***" \
-                "http://127.0.0.1:8090/api/v1/auth/machine-identities" 2>/dev/null \
-                | jq -r '.machineIdentities[]? | select(.name=="streamlit-operator") | .id // empty' \
+                -H "Authorization: Bearer ${identity_token}" \
+                "http://127.0.0.1:8090/api/v1/projects/${project_id}/identities?search=streamlit-operator" 2>/dev/null \
+                | jq -r '.identities[]? | select(.name=="streamlit-operator") | .id // empty' \
                 2>/dev/null | head -1 || true)
         fi
         if [ -z "$mi_id" ]; then
-            log_warn "Could not create or find machine identity (HTTP $mi_resp); Secrets page will show 'token not initialized'"
+            log_warn "Could not create or find operator identity (HTTP $mi_resp); Secrets page will show 'token not initialized'"
             log_warn "  Body: $(head -c 400 /tmp/infisical-mi.json 2>/dev/null)"
         else
-            log_success "Machine identity 'streamlit-operator' id=${mi_id}"
+            log_success "Operator identity 'streamlit-operator' id=${mi_id} (viewer role on project ${project_id})"
 
-            # Step 2: add a universal auth client to the identity (one-time).
+            # Step 2: attach universal-auth to the identity (required before
+            # client secrets can be created against it).
+            local attach_resp
+            attach_resp=$(curl -sS -o /tmp/infisical-attach.json -w '%{http_code}' --max-time 30 \
+                -H 'Content-Type: application/json' \
+                -H "Authorization: Bearer ${identity_token}" \
+                -X POST "http://127.0.0.1:8090/api/v1/auth/universal-auth/identities/${mi_id}" \
+                2>/dev/null || echo "000")
+            if [ "$attach_resp" != "200" ]; then
+                log_warn "attachUniversalAuth returned HTTP $attach_resp (may already be attached, continuing)"
+                log_info "  Body: $(head -c 400 /tmp/infisical-attach.json 2>/dev/null)"
+            else
+                log_success "Universal auth attached to operator identity"
+            fi
+
+            # Step 3: add a universal-auth client secret (one-time).
+            # v0.166.2 body shape: {description, numUsesLimit, ttl}.
+            # v0.166.2 response shape: { clientSecret, clientSecretData }.
+            # The clientId used at login is clientSecretData.id (NOT the identity id).
             local ua_resp client_id client_secret
             ua_resp=$(curl -sS -o /tmp/infisical-ua.json -w '%{http_code}' --max-time 30 \
                 -H 'Content-Type: application/json' \
-                -H "Authorization: Bearer ***" \
-                -X POST "http://127.0.0.1:8090/api/v1/auth/machine-identities/${mi_id}/universal-auth" \
-                -d '{}' \
+                -H "Authorization: Bearer ${identity_token}" \
+                -X POST "http://127.0.0.1:8090/api/v1/auth/universal-auth/identities/${mi_id}/client-secrets" \
+                -d '{"description":"AdminLM operator client secret","numUsesLimit":0,"ttl":0}' \
                 2>/dev/null || echo "000")
-            client_id=$(jq -r '.clientId // empty' /tmp/infisical-ua.json 2>/dev/null || true)
+            client_id=$(jq -r '.clientSecretData.id // empty' /tmp/infisical-ua.json 2>/dev/null || true)
             client_secret=$(jq -r '.clientSecret // empty' /tmp/infisical-ua.json 2>/dev/null || true)
             if [ -z "$client_id" ] || [ -z "$client_secret" ]; then
-                log_warn "Universal-auth add did not return clientId/clientSecret (HTTP $ua_resp)"
+                log_warn "Operator client-secrets did not return clientId/clientSecret (HTTP $ua_resp)"
                 log_warn "  Body: $(head -c 400 /tmp/infisical-ua.json 2>/dev/null)"
             else
-                log_success "Universal-auth client created"
+                log_success "Operator universal-auth client created"
 
-                # Step 3: exchange clientId/clientSecret for an access token.
+                # Step 4: exchange clientId/clientSecret for an access token.
+                # Login endpoint is /api/v1/auth/universal-auth/login — NOT
+                # identity-scoped (the clientId in the body identifies the secret).
                 local login_resp
                 login_resp=$(curl -sS -o /tmp/infisical-login.json -w '%{http_code}' --max-time 30 \
                     -H 'Content-Type: application/json' \
-                    -X POST "http://127.0.0.1:8090/api/v1/auth/machine-identities/${mi_id}/universal-auth/login" \
+                    -X POST "http://127.0.0.1:8090/api/v1/auth/universal-auth/login" \
                     -d "{\"clientId\":\"${client_id}\",\"clientSecret\":\"${client_secret}\"}" \
                     2>/dev/null || echo "000")
                 operator_token=$(jq -r '.accessToken // empty' /tmp/infisical-login.json 2>/dev/null || true)
                 if [ -z "$operator_token" ]; then
-                    log_warn "Universal-auth login did not return accessToken (HTTP $login_resp)"
+                    log_warn "Operator universal-auth login did not return accessToken (HTTP $login_resp)"
                     log_warn "  Body: $(head -c 400 /tmp/infisical-login.json 2>/dev/null)"
                 else
                     log_success "Operator access token acquired (lives in $operator_env)"
-
-                    # Step 4: grant Viewer role on the project (read-only).
-                    # The Infisical role name 'viewer' maps to read-only at the
-                    # project level. If the endpoint shape differs on v0.166.2
-                    # (it has shifted between minor versions), we log a warn
-                    # but keep the token — the operator can still auth, just
-                    # with org-level visibility rather than per-project.
-                    local perm_resp
-                    perm_resp=$(curl -sS -o /tmp/infisical-perm.json -w '%{http_code}' --max-time 30 \
-                        -H 'Content-Type: application/json' \
-                        -H "Authorization: Bearer ***" \
-                        -X POST "http://127.0.0.1:8090/api/v1/project-machine-identities" \
-                        -d "{\"machineIdentityId\":\"${mi_id}\",\"projectId\":\"${project_id}\",\"role\":\"viewer\",\"isTemporary\":false}" \
-                        2>/dev/null || echo "000")
-                    if [ "$perm_resp" = "200" ]; then
-                        log_success "Granted viewer role on project ${project_id}"
-                    else
-                        log_warn "Could not grant viewer role on project (HTTP $perm_resp); token still valid but unconstrained"
-                        log_warn "  Body: $(head -c 400 /tmp/infisical-perm.json 2>/dev/null)"
-                    fi
                 fi
             fi
         fi
     fi
 
     # ------------------------------------------------------------------
-    # 6c) BACKLOG #94 Phase 5 — generate the agent-default machine identity.
-    #     Mirrors step 6b (operator identity) but writes the access token
-    #     to a SEPARATE file (~/.hermes/secrets/infisical-agent.env) for
-    #     strict least-privilege separation: the operator token grants
-    #     Streamlit full path-scope CRUD via the Secrets page; the agent
-    #     token grants infisical-mcp read-only access on operator-approved
-    #     paths. A compromised agent token has blast radius = read-only.
-    #
-    #     Idempotency: skip if INFISICAL_AGENT_BOOTSTRAP_DONE=true is
-    #     already set in the agent env file (re-runs MUST NOT invalidate
-    #     the running infisical-mcp's working token).
-    #
-    #     We reuse the same 4-step sequence as step 6b (create identity,
-    #     add universal-auth, login, grant role) but with name
-    #     "agent-default" and target env file infisical-agent.env.
-    # ------------------------------------------------------------------
-    local agent_env="$secrets_dir/infisical-agent.env"
-    local agent_token=""
-    if grep -q '^INFISICAL_AGENT_BOOTSTRAP_DONE=true$' "$agent_env" 2>/dev/null; then
-        agent_token=$(grep '^INFISICAL_AGENT_TOKEN=' "$agent_env" | head -1 | cut -d= -f2- || true)
-        if [ -n "$agent_token" ]; then
-            log_success "INFISICAL_AGENT_TOKEN already set in $agent_env; skipping machine-identity generation"
-        fi
-    fi
-
-    if [ -z "$agent_token" ] && [ -n "$identity_token" ] && [ -n "$project_id" ]; then
-        log_info "Generating read-only agent-default machine identity for infisical-mcp..."
-
-        # Step 1: create machine identity (org-level)
-        local agent_mi_resp agent_mi_id
-        agent_mi_resp=$(curl -sS -o /tmp/infisical-agent-mi.json -w '%{http_code}' --max-time 30 \
-            -H 'Content-Type: application/json' \
-            -H "Authorization: Bearer ***" \
-            -X POST "http://127.0.0.1:8090/api/v1/auth/machine-identities" \
-            -d '{"name":"agent-default","description":"Read-only agent identity for infisical-mcp (BACKLOG #94 Phase 5). Path scope is managed via the operator scope-policy UI."}' \
-            2>/dev/null || echo "000")
-        agent_mi_id=$(jq -r '.machineIdentity.id // empty' /tmp/infisical-agent-mi.json 2>/dev/null || true)
-        if [ -z "$agent_mi_id" ]; then
-            # Maybe the identity already exists (re-run). Try to look it up.
-            log_info "Agent machine identity create did not return id (HTTP $agent_mi_resp) — looking up by name..."
-            agent_mi_id=$(curl -sS --max-time 15 \
-                -H "Authorization: Bearer ***" \
-                "http://127.0.0.1:8090/api/v1/auth/machine-identities" 2>/dev/null \
-                | jq -r '.machineIdentities[]? | select(.name=="agent-default") | .id // empty' \
-                2>/dev/null | head -1 || true)
-        fi
-        if [ -z "$agent_mi_id" ]; then
-            log_warn "Could not create or find agent-default machine identity (HTTP $agent_mi_resp); infisical-mcp will fail at startup"
-            log_warn "  Body: $(head -c 400 /tmp/infisical-agent-mi.json 2>/dev/null)"
-        else
-            log_success "Machine identity 'agent-default' id=${agent_mi_id}"
-
-            # Step 2: add universal-auth (POST .../{id}/universal-auth). May
-            # already exist on a re-run; if so the response will be a 4xx and
-            # we fall back to the existing clientId/clientSecret by inspecting
-            # the identity's auth methods (the universal-auth list endpoint
-            # shape is not stable across v0.166.x patch releases, so we just
-            # log and continue — the operator can manually rotate if needed).
-            local agent_ua_resp agent_client_id agent_client_secret
-            agent_ua_resp=$(curl -sS -o /tmp/infisical-agent-ua.json -w '%{http_code}' --max-time 30 \
-                -H 'Content-Type: application/json' \
-                -H "Authorization: Bearer ***" \
-                -X POST "http://127.0.0.1:8090/api/v1/auth/machine-identities/${agent_mi_id}/universal-auth" \
-                -d '{}' \
-                2>/dev/null || echo "000")
-            agent_client_id=$(jq -r '.clientId // empty' /tmp/infisical-agent-ua.json 2>/dev/null || true)
-            agent_client_secret=$(jq -r '.clientSecret // empty' /tmp/infisical-agent-ua.json 2>/dev/null || true)
-            if [ -z "$agent_client_id" ] || [ -z "$agent_client_secret" ]; then
-                log_warn "Agent universal-auth add did not return clientId/clientSecret (HTTP $agent_ua_resp)"
-                log_warn "  Body: $(head -c 400 /tmp/infisical-agent-ua.json 2>/dev/null)"
-                log_warn "  Re-rotate via the AdminLM Secrets page scope-policy UI"
-            else
-                log_success "Agent universal-auth client created"
-
-                # Step 3: exchange clientId/clientSecret for an access token.
-                local agent_login_resp
-                agent_login_resp=$(curl -sS -o /tmp/infisical-agent-login.json -w '%{http_code}' --max-time 30 \
-                    -H 'Content-Type: application/json' \
-                    -X POST "http://127.0.0.1:8090/api/v1/auth/machine-identities/${agent_mi_id}/universal-auth/login" \
-                    -d "{\"clientId\":\"${agent_client_id}\",\"clientSecret\":\"${agent_client_secret}\"}" \
-                    2>/dev/null || echo "000")
-                agent_token=$(jq -r '.accessToken // empty' /tmp/infisical-agent-login.json 2>/dev/null || true)
-                if [ -z "$agent_token" ]; then
-                    log_warn "Agent universal-auth login did not return accessToken (HTTP $agent_login_resp)"
-                    log_warn "  Body: $(head -c 400 /tmp/infisical-agent-login.json 2>/dev/null)"
-                else
-                    log_success "Agent access token acquired (lives in $agent_env)"
-
-                    # Step 4: grant Viewer role on the project. Per BACKLOG #94
-                    # v1.0 the agent has READ-ONLY access — same Viewer role as
-                    # the operator identity. Path-scoping is via the operator's
-                    # scope-policy UI; the v1.0 limitation is project-wide
-                    # Viewer (folder-scoped grants require custom roles that
-                    # aren't stable in v0.166.2 — tracked as v1.x follow-up).
-                    local agent_perm_resp
-                    agent_perm_resp=$(curl -sS -o /tmp/infisical-agent-perm.json -w '%{http_code}' --max-time 30 \
-                        -H 'Content-Type: application/json' \
-                        -H "Authorization: Bearer ***" \
-                        -X POST "http://127.0.0.1:8090/api/v1/project-machine-identities" \
-                        -d "{\"machineIdentityId\":\"${agent_mi_id}\",\"projectId\":\"${project_id}\",\"role\":\"viewer\",\"isTemporary\":false}" \
-                        2>/dev/null || echo "000")
-                    if [ "$agent_perm_resp" = "200" ]; then
-                        log_success "Granted viewer role on project ${project_id} (agent token is read-only)"
-                    else
-                        log_warn "Could not grant viewer role on project (HTTP $agent_perm_resp); token still valid but unconstrained"
-                        log_warn "  Body: $(head -c 400 /tmp/infisical-agent-perm.json 2>/dev/null)"
-                    fi
-                fi
-            fi
-        fi
-    fi
-
-    # ------------------------------------------------------------------
-    # 7) Persist operator + agent creds to ~/.hermes/secrets/.
+    # 7) Persist operator creds to ~/.hermes/secrets/.
     #    Operator env: ~/.hermes/secrets/infisical-operator.env (chmod 600).
-    #    Agent env:    ~/.hermes/secrets/infisical-agent.env    (chmod 600).
-    #    SEPARATE files enforce least-privilege separation of concerns —
-    #    operator token grants Streamlit full path-scope CRUD; agent token
-    #    grants infisical-mcp read-only access.
+    #
+    #    NOTE: the agent env (~/.hermes/secrets/infisical-agent.env) is
+    #    written by provision_infisical_agent_identity(), which is called
+    #    from main() AFTER this function returns (so the upgrade path —
+    #    operator env already present from a prior bootstrap — can
+    #    provision/repair the agent identity without re-running the
+    #    first-boot steps above).
     # ------------------------------------------------------------------
     local pg_pw redis_pw auth_secret enc_key
     pg_pw=$(grep '^POSTGRES_PASSWORD=' "$env_file" | head -1 | cut -d= -f2-)
@@ -2618,7 +2512,7 @@ INFISICAL_REDIS_PASSWORD=${redis_pw}
 INFISICAL_AUTH_SECRET=${auth_secret}
 INFISICAL_ENCRYPTION_KEY=${enc_key}
 
-# --- Admin user + organization + machine identity (root-level token) ---
+# --- Admin user + organization + project ---
 INFISICAL_ADMIN_EMAIL=${admin_email}
 INFISICAL_ADMIN_PASSWORD=${admin_pw}
 INFISICAL_ORG_ID=${org_id}
@@ -2635,36 +2529,170 @@ EOF
     log_info "  Project ID:   ${project_id:-<lookup on next run>}"
     log_info "  Admin email:  ${admin_email}"
     log_info "  UI URL:       http://127.0.0.1:8090 (operator-only, loopback binding in docker-compose.yml)"
+}
 
-    # ------------------------------------------------------------------
-    # 7b) Write the AGENT env file (~/.hermes/secrets/infisical-agent.env).
-    #     chmod 600. Read by install_infisical_mcp() to compose-up
-    #     infisical-mcp with the right access token. SEPARATE file from
-    #     the operator env so a leaked operator token can't be reused
-    #     against the agent's read-only scope (and vice-versa).
-    # ------------------------------------------------------------------
+
+# ============================================
+# Provision the Infisical agent-default machine identity
+# ============================================
+#
+# BACKLOG #94 Phase 5 — creates the 'agent-default' machine identity that
+# infisical-mcp authenticates with, and persists its access token to
+# ~/.hermes/secrets/infisical-agent.env (chmod 600).
+#
+# Self-sufficient: reads the admin token + project id from the operator
+# env file (~/.hermes/secrets/infisical-operator.env), so the upgrade path
+# (operator env already present, agent env absent) can repair/mint the
+# agent token without re-running deploy_infisical_stack's first-boot steps.
+#
+# Sequence (Infisical v0.166.2 — verified against the pinned source tree;
+# the same 4-step flow as the operator identity, with name "agent-default"):
+#   1. POST /api/v1/projects/{projectId}/identities
+#      body: {name:"agent-default", roles:[{role:"viewer",isTemporary:false}]}
+#      → creates project-scoped identity WITH viewer role in one call
+#      → { identity: { id } }
+#   2. POST /api/v1/auth/universal-auth/identities/{id}
+#      (no body) → enables universal-auth on the identity
+#   3. POST /api/v1/auth/universal-auth/identities/{id}/client-secrets
+#      body: {description, numUsesLimit, ttl}
+#      → { clientSecret, clientSecretData: { id: clientId } }
+#   4. POST /api/v1/auth/universal-auth/login
+#      body: {clientId, clientSecret} → { accessToken }
+#
+# Idempotency: skip if INFISICAL_AGENT_BOOTSTRAP_DONE=true is already set
+# in the agent env file. Re-runs MUST NOT invalidate the running
+# infisical-mcp's working token.
+#
+# Called from main() AFTER deploy_infisical_stack() returns. This is the
+# reviewer's recommended fix for the outer-gate blocking defect: the
+# agent identity is provisioned independently of the operator bootstrap's
+# idempotency gate, so the upgrade path works.
+
+provision_infisical_agent_identity() {
+    local secrets_dir="$HERMES_HOME/secrets"
+    local operator_env="$secrets_dir/infisical-operator.env"
+    local agent_env="$secrets_dir/infisical-agent.env"
+    mkdir -p "$secrets_dir"
+    chmod 700 "$secrets_dir"
+
+    # Idempotency gate — skip if agent env already has a working token.
+    local agent_token=""
+    if grep -q '^INFISICAL_AGENT_BOOTSTRAP_DONE=true$' "$agent_env" 2>/dev/null; then
+        agent_token=$(grep '^INFISICAL_AGENT_TOKEN=' "$agent_env" | head -1 | cut -d= -f2- || true)
+        if [ -n "$agent_token" ]; then
+            log_success "INFISICAL_AGENT_TOKEN already set in $agent_env; skipping agent identity provisioning"
+            return 0
+        fi
+    fi
+
+    # Need admin_token + project_id. Read from operator_env (works on both
+    # first-boot and upgrade paths).
+    if [ ! -f "$operator_env" ]; then
+        log_warn "operator env not found at $operator_env; cannot provision agent identity"
+        log_warn "  Run: bootstrap.sh deploy_infisical_stack first"
+        return 0
+    fi
+    local admin_token project_id
+    admin_token=$(grep '^INFISICAL_ADMIN_TOKEN=' "$operator_env" | head -1 | cut -d= -f2- || true)
+    project_id=$(grep '^INFISICAL_PROJECT_ID=' "$operator_env" | head -1 | cut -d= -f2- || true)
+    if [ -z "$admin_token" ] || [ -z "$project_id" ]; then
+        log_warn "admin_token or project_id missing in $operator_env; cannot provision agent identity"
+        return 0
+    fi
+
+    log_info "Provisioning read-only agent-default machine identity for infisical-mcp..."
+
+    # Step 1: create project-scoped identity WITH viewer role in one call.
+    local agent_mi_resp agent_mi_id
+    agent_mi_resp=$(curl -sS -o /tmp/infisical-agent-mi.json -w '%{http_code}' --max-time 30 \
+        -H 'Content-Type: application/json' \
+        -H "Authorization: Bearer ${admin_token}" \
+        -X POST "http://127.0.0.1:8090/api/v1/projects/${project_id}/identities" \
+        -d '{"name":"agent-default","roles":[{"role":"viewer","isTemporary":false}]}' \
+        2>/dev/null || echo "000")
+    agent_mi_id=$(jq -r '.identity.id // empty' /tmp/infisical-agent-mi.json 2>/dev/null || true)
+    if [ -z "$agent_mi_id" ]; then
+        log_info "Agent identity create did not return id (HTTP $agent_mi_resp) — looking up by name..."
+        agent_mi_id=$(curl -sS --max-time 15 \
+            -H "Authorization: Bearer ${admin_token}" \
+            "http://127.0.0.1:8090/api/v1/projects/${project_id}/identities?search=agent-default" 2>/dev/null \
+            | jq -r '.identities[]? | select(.name=="agent-default") | .id // empty' \
+            2>/dev/null | head -1 || true)
+    fi
+    if [ -z "$agent_mi_id" ]; then
+        log_warn "Could not create or find agent-default identity (HTTP $agent_mi_resp); infisical-mcp will fail at startup"
+        log_warn "  Body: $(head -c 400 /tmp/infisical-agent-mi.json 2>/dev/null)"
+        return 0
+    fi
+    log_success "Project-scoped identity 'agent-default' id=${agent_mi_id} (viewer role on project ${project_id})"
+
+    # Step 2: attach universal-auth (required before client-secrets).
+    local attach_resp
+    attach_resp=$(curl -sS -o /tmp/infisical-agent-attach.json -w '%{http_code}' --max-time 30 \
+        -H 'Content-Type: application/json' \
+        -H "Authorization: Bearer ${admin_token}" \
+        -X POST "http://127.0.0.1:8090/api/v1/auth/universal-auth/identities/${agent_mi_id}" \
+        2>/dev/null || echo "000")
+    if [ "$attach_resp" != "200" ]; then
+        log_warn "attachUniversalAuth returned HTTP $attach_resp (may already be attached, continuing)"
+        log_info "  Body: $(head -c 400 /tmp/infisical-agent-attach.json 2>/dev/null)"
+    else
+        log_success "Universal auth attached to agent identity"
+    fi
+
+    # Step 3: add a universal-auth client secret (one-time).
+    local agent_ua_resp agent_client_id agent_client_secret
+    agent_ua_resp=$(curl -sS -o /tmp/infisical-agent-ua.json -w '%{http_code}' --max-time 30 \
+        -H 'Content-Type: application/json' \
+        -H "Authorization: Bearer ${admin_token}" \
+        -X POST "http://127.0.0.1:8090/api/v1/auth/universal-auth/identities/${agent_mi_id}/client-secrets" \
+        -d '{"description":"AdminLM agent client secret","numUsesLimit":0,"ttl":0}' \
+        2>/dev/null || echo "000")
+    # v0.166.2: clientId used at login = clientSecretData.id (NOT the identity id).
+    agent_client_id=$(jq -r '.clientSecretData.id // empty' /tmp/infisical-agent-ua.json 2>/dev/null || true)
+    agent_client_secret=$(jq -r '.clientSecret // empty' /tmp/infisical-agent-ua.json 2>/dev/null || true)
+    if [ -z "$agent_client_id" ] || [ -z "$agent_client_secret" ]; then
+        log_warn "Agent client-secrets did not return clientId/clientSecret (HTTP $agent_ua_resp)"
+        log_warn "  Body: $(head -c 400 /tmp/infisical-agent-ua.json 2>/dev/null)"
+        return 0
+    fi
+    log_success "Agent universal-auth client created"
+
+    # Step 4: exchange clientId/clientSecret for an access token.
+    local agent_login_resp
+    agent_login_resp=$(curl -sS -o /tmp/infisical-agent-login.json -w '%{http_code}' --max-time 30 \
+        -H 'Content-Type: application/json' \
+        -X POST "http://127.0.0.1:8090/api/v1/auth/universal-auth/login" \
+        -d "{\"clientId\":\"${agent_client_id}\",\"clientSecret\":\"${agent_client_secret}\"}" \
+        2>/dev/null || echo "000")
+    agent_token=$(jq -r '.accessToken // empty' /tmp/infisical-agent-login.json 2>/dev/null || true)
+    if [ -z "$agent_token" ]; then
+        log_warn "Agent universal-auth login did not return accessToken (HTTP $agent_login_resp)"
+        log_warn "  Body: $(head -c 400 /tmp/infisical-agent-login.json 2>/dev/null)"
+        return 0
+    fi
+    log_success "Agent access token acquired"
+
+    # Write agent env (chmod 600) — SEPARATE file from operator env for
+    # strict least-privilege separation: a leaked operator token cannot be
+    # reused against the agent's read-only scope (and vice-versa).
     cat > "$agent_env" <<EOF
-# Generated by bootstrap.sh deploy_infisical_stack() on $(date -u +%Y-%m-%dT%H:%M:%SZ)
+# Generated by bootstrap.sh provision_infisical_agent_identity() on $(date -u +%Y-%m-%dT%H:%M:%SZ)
 # BACKLOG #94 Phase 5 — agent-default machine-identity creds for infisical-mcp.
 # chmod 600; readable only by the operator user (typically ansible).
-# This is the AGENT token (viewer role, used by infisical-mcp). The operator
+# This is the AGENT token (viewer role on production project). The operator
 # token (full CRUD via Streamlit) lives in infisical-operator.env — NEVER
 # mix the two.
 
 INFISICAL_PROJECT_ID=${project_id}
 INFISICAL_AGENT_TOKEN=${agent_token}
 
-# --- Idempotency gate for re-runs (skips the 4-step identity-bootstrap
-#     sequence if the env file already has a working token) ---
+# --- Idempotency gate ---
 INFISICAL_AGENT_BOOTSTRAP_DONE=true
 EOF
     chmod 600 "$agent_env"
     log_success "Wrote Infisical agent creds to $agent_env (chmod 600)"
-    if [ -n "$agent_token" ]; then
-        log_info "  Agent token:  set (length=${#agent_token})"
-    else
-        log_warn "  Agent token:  EMPTY — infisical-mcp will fail until step 6c completes successfully on a re-run"
-    fi
+    log_info "  Agent token:  set (length=${#agent_token})"
 }
 
 # ============================================
@@ -2706,7 +2734,7 @@ install_infisical_mcp() {
     if [ ! -d "$mcp_log_dir" ]; then
         log_info "Creating Loki log dir for infisical-mcp: $mcp_log_dir"
         mkdir -p "$mcp_log_dir"
-        chmod 777 "$mcp_log_dir" 2>/dev/null || sudo chmod 777 "$mcp_log_dir" || true
+        chmod 755 "$mcp_log_dir" 2>/dev/null || sudo chmod 755 "$mcp_log_dir" || true
     fi
 
     # 2) Source the agent env file so compose expandenv resolves
@@ -3671,6 +3699,14 @@ main() {
     # Phase 5, backup integration Phase 9) have a live vault to talk to.
     # Bound to 127.0.0.1:8090 — operator-only, customer never reaches the UI.
     deploy_infisical_stack
+
+    # BACKLOG #94 Phase 5: provision the agent-default machine identity
+    # AFTER deploy_infisical_stack returns. Runs on BOTH first-boot and
+    # upgrade paths — self-sufficient, reads admin token + project id from
+    # ~/.hermes/secrets/infisical-operator.env. MUST complete before
+    # install_infisical_mcp so the agent env file (INFISICAL_AGENT_TOKEN)
+    # exists for compose expandenv at container start time.
+    provision_infisical_agent_identity
 
     # BACKLOG #94 Phase 5: deploy infisical-mcp (read-only agent consumer).
     # Must run AFTER deploy_infisical_stack (so the agent-default machine

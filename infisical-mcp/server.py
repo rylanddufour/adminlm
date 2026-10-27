@@ -52,6 +52,7 @@ import os
 import sys
 import traceback
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 from fastmcp import FastMCP
@@ -254,7 +255,10 @@ def get_secret(secret_path: str, secret_key: str) -> dict:
                         success=False, error="config_missing")
         return cfg_err
 
-    url = f"{INFISICAL_URL}/api/v3/secrets/raw/{secret_key}"
+    # URL-encode the key: httpx does NOT encode path segments, so a key
+    # containing "/" or ".." could redirect the GET at a different
+    # Infisical endpoint on the same host. safe="" encodes "/" too.
+    url = f"{INFISICAL_URL}/api/v3/secrets/raw/{quote(secret_key, safe='')}"
     params = {
         "workspaceId": INFISICAL_PROJECT_ID,
         "environment": INFISICAL_ENVIRONMENT,
@@ -356,13 +360,14 @@ def list_paths(path_prefix: str = DEFAULT_PATH_PREFIX) -> list[dict]:
 
 
 @mcp.tool()
-def list_systems(path_prefix: str = DEFAULT_PATH_PREFIX) -> list[str]:
-    """Enumerate unique system folder names under a path prefix.
+def list_systems(path_prefix: str = DEFAULT_PATH_PREFIX) -> list[Any]:
+    """Enumerate unique system folder names under a path prefix. READ-ONLY.
 
     Use this when the agent doesn't know what systems exist. Returns
     the sorted unique folder-name list (e.g. ["ad", "ssh", "vmware"]).
     Folders are Infisical's organization unit; each system has its own
-    folder with the customer's IT credentials inside.
+    folder with the customer's IT credentials inside. Strict read-only
+    contract — no secret values are read or returned.
 
     Args:
         path_prefix: Infisical folder path to scan recursively. Default
@@ -372,7 +377,8 @@ def list_systems(path_prefix: str = DEFAULT_PATH_PREFIX) -> list[str]:
         Sorted unique list[str] of system names. On failure: a
         single-element list containing a {error, ...} dict — the agent
         can pattern-match len() == 1 and the first element's "error"
-        key. NEVER an exception / traceback.
+        key. NEVER an exception / traceback. The annotation is list[Any]
+        because the failure element is a dict, not a str.
     """
     cfg_err = _require_config()
     if cfg_err is not None:

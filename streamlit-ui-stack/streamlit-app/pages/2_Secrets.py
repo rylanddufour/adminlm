@@ -280,24 +280,25 @@ def _read_secret(path: str, secret_key: str) -> dict:
 # Machine-identity API helpers (Phase 4 — operator scope-policy UI)
 # ---------------------------------------------------------------------------
 #
-# Infisical v0.166.2 machine-identity endpoints used here:
+# Infisical v0.166.2 machine-identity endpoints used here (verified against
+# the pinned source tree — there is NO /api/v1/auth/machine-identities or
+# /api/v1/project-machine-identities path in this version):
 #
-#   GET    /api/v1/auth/machine-identities?projectId={pid}
-#          → list all machine identities in the project
-#   POST   /api/v1/auth/machine-identities
-#          body: {"name": "...", "description": "..."}
-#          → create new identity, returns {id, ...}
-#   POST   /api/v1/auth/machine-identities/{id}/universal-auth
-#          → add a universal-auth client (one-time per rotation)
-#          → returns {clientId, clientSecret}
-#   POST   /api/v1/auth/machine-identities/{id}/universal-auth/login
+#   GET    /api/v1/projects/{projectId}/identities
+#          → list project-scoped identities → {identities: [...], totalCount}
+#   POST   /api/v1/projects/{projectId}/identities
+#          body: {"name": "...", "roles": [{"role": "viewer", "isTemporary": false}]}
+#          → create identity WITH project role in one call → {identity: {id}}
+#   POST   /api/v1/auth/universal-auth/identities/{id}
+#          (no body) → enable universal-auth on the identity
+#   POST   /api/v1/auth/universal-auth/identities/{id}/client-secrets
+#          body: {"description": "...", "numUsesLimit": 0, "ttl": 0}
+#          → {clientSecret, clientSecretData: {id: clientId}}
+#   POST   /api/v1/auth/universal-auth/login
 #          body: {"clientId": "...", "clientSecret": "..."}
-#          → exchange for access token, returns {accessToken, tokenType, expiresIn}
-#   POST   /api/v1/project-machine-identities
-#          body: {"machineIdentityId": "...", "projectId": "...", "role": "viewer", "isTemporary": false}
-#          → grant role on the project (read-only "viewer")
-#   DELETE /api/v1/auth/machine-identities/{id}
-#          → delete identity (cascades: revokes all credentials, role grants)
+#          → {accessToken, tokenType, expiresIn}
+#   DELETE /api/v1/identities/{id}
+#          → delete identity (cascades: revokes all credentials)
 #
 # Auth for reads: operator token (viewer role is sufficient for listing).
 # Auth for writes (create/rotate/revoke): bootstrap-time admin token
@@ -320,16 +321,19 @@ def _list_machine_identities() -> list[dict]:
     whichever fields it needs for display.
     """
     base = _infisical_url().rstrip("/")
+    # v0.166.2: GET /api/v1/projects/{projectId}/identities → {identities, totalCount}
+    # Project-scoped (no orgId needed; lists identities created in this project
+    # via POST /api/v1/projects/{projectId}/identities).
     pid = _project_id()
-    url = f"{base}/api/v1/auth/machine-identities?projectId={pid}"
-    # Read uses operator token — viewer role can list identities.
+    url = f"{base}/api/v1/projects/{pid}/identities"
+    # Read uses operator token — viewer role is sufficient for listing identities.
     headers = {"Authorization": f"Bearer {_operator_token()}"}
     resp = httpx.get(url, headers=headers, timeout=_API_TIMEOUT_S)
     resp.raise_for_status()
     body = resp.json()
     if isinstance(body, dict):
-        # v3 shape: {"machineIdentities": [...]} or {"data": [...]}.
-        for key in ("machineIdentities", "data", "identities"):
+        # v0.166.2 shape: {"identities": [...], "totalCount": N} or {"data": [...]}.
+        for key in ("identities", "data"):
             if key in body:
                 return body[key] or []
         return []
@@ -341,8 +345,15 @@ def _list_machine_identities() -> list[dict]:
 def _create_machine_identity(name: str, description: str) -> str:
     """Create a machine identity. Returns the new id (empty string on failure)."""
     base = _infisical_url().rstrip("/")
-    url = f"{base}/api/v1/auth/machine-identities"
-    payload = {"name": name, "description": description}
+    pid = _project_id()
+    # v0.166.2: POST /api/v1/projects/{projectId}/identities → {identity: {id}}
+    # body: {name, roles:[{role, isTemporary}]} — creates identity AND grants
+    # project role in one call (createProjectMachineIdentity).
+    url = f"{base}/api/v1/projects/{pid}/identities"
+    payload = {
+        "name": name,
+        "roles": [{"role": AGENT_ROLE, "isTemporary": False}],
+    }
     resp = httpx.post(
         url,
         headers={**_admin_headers(), "Content-Type": "application/json"},
@@ -351,10 +362,13 @@ def _create_machine_identity(name: str, description: str) -> str:
     )
     resp.raise_for_status()
     body = resp.json()
-    # v3 wraps in {"machineIdentity": {...}}.
-    mi = body.get("machineIdentity") if isinstance(body, dict) else None
+    # v0.166.2 wraps in {"identity": {...}}.
+    mi = body.get("identity") if isinstance(body, dict) else None
     if isinstance(mi, dict):
         return mi.get("id") or ""
+    # Fall back to a flat shape (some builds return the identity directly).
+    if isinstance(body, dict) and body.get("id"):
+        return body["id"]
     return ""
 
 
@@ -365,19 +379,33 @@ def _add_universal_auth(mi_id: str) -> tuple[str, str]:
     One-time per identity creation; rotate = call this again (replaces).
     """
     base = _infisical_url().rstrip("/")
-    url = f"{base}/api/v1/auth/machine-identities/{mi_id}/universal-auth"
-    resp = httpx.post(url, headers=_admin_headers(), timeout=_API_TIMEOUT_S)
+    # v0.166.2: POST /api/v1/auth/universal-auth/identities/{id}/client-secrets
+    # → {clientSecret, clientSecretData}. The clientId used at login is
+    # clientSecretData.id — NOT the identity id.
+    url = f"{base}/api/v1/auth/universal-auth/identities/{mi_id}/client-secrets"
+    payload = {"description": "AdminLM agent client secret", "numUsesLimit": 0, "ttl": 0}
+    resp = httpx.post(
+        url,
+        headers={**_admin_headers(), "Content-Type": "application/json"},
+        json=payload,
+        timeout=_API_TIMEOUT_S,
+    )
     resp.raise_for_status()
     body = resp.json()
     if isinstance(body, dict):
-        return body.get("clientId") or "", body.get("clientSecret") or ""
+        data = body.get("clientSecretData") or {}
+        client_id = data.get("id") if isinstance(data, dict) else None
+        return client_id or "", body.get("clientSecret") or ""
     return "", ""
 
 
 def _exchange_for_token(mi_id: str, client_id: str, client_secret: str) -> str:
     """Exchange client_id+secret for an access_token. Returns "" on failure."""
     base = _infisical_url().rstrip("/")
-    url = f"{base}/api/v1/auth/machine-identities/{mi_id}/universal-auth/login"
+    # v0.166.2: POST /api/v1/auth/universal-auth/login → {accessToken, tokenType, expiresIn}
+    # Note: the login endpoint is NOT identity-scoped — the clientId in the
+    # body identifies the client secret, not the identity.
+    url = f"{base}/api/v1/auth/universal-auth/login"
     payload = {"clientId": client_id, "clientSecret": client_secret}
     resp = httpx.post(
         url,
@@ -393,38 +421,23 @@ def _exchange_for_token(mi_id: str, client_id: str, client_secret: str) -> str:
 
 
 def _grant_role(mi_id: str, role: str = AGENT_ROLE) -> bool:
-    """Grant a role on the project for the given machine identity.
+    """No-op in v0.166.2: project-scoped identities are created WITH the role.
 
-    Idempotent at the API level: re-granting the same role may 200 or 4xx
-    depending on Infisical's tolerance; we treat any non-2xx as a soft
-    failure (logged but not raised — the token still works for reads
-    even without the project role grant). Caller can decide to retry.
+    v0.166.2 POST /api/v1/projects/{projectId}/identities (createProjectMachineIdentity)
+    creates the identity AND grants the project role in one call. There is no
+    separate "grant role to existing identity" endpoint in v0.166.2 that the
+    viewer role can call, so this function returns True for any already-created
+    identity. Kept for backward compatibility with the Phase 4 caller.
     """
-    base = _infisical_url().rstrip("/")
-    pid = _project_id()
-    url = f"{base}/api/v1/project-machine-identities"
-    payload = {
-        "machineIdentityId": mi_id,
-        "projectId": pid,
-        "role": role,
-        "isTemporary": False,
-    }
-    try:
-        resp = httpx.post(
-            url,
-            headers={**_admin_headers(), "Content-Type": "application/json"},
-            json=payload,
-            timeout=_API_TIMEOUT_S,
-        )
-        return resp.status_code in (200, 201)
-    except httpx.HTTPError:
-        return False
+    # Identity creation already granted the role — nothing to do.
+    return bool(mi_id)
 
 
 def _revoke_machine_identity(mi_id: str) -> None:
     """Delete the machine identity (cascades: credentials + role grants)."""
     base = _infisical_url().rstrip("/")
-    url = f"{base}/api/v1/auth/machine-identities/{mi_id}"
+    # v0.166.2: DELETE /api/v1/identities/{identityId}
+    url = f"{base}/api/v1/identities/{mi_id}"
     resp = httpx.delete(url, headers=_admin_headers(), timeout=_API_TIMEOUT_S)
     # 404 on already-deleted is fine — operator-initiated revoke is
     # idempotent in spirit.
