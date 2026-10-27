@@ -2456,7 +2456,12 @@ EOF
                 -X POST "http://127.0.0.1:8090/api/v1/auth/universal-auth/identities/${mi_id}/client-secrets" \
                 -d '{"description":"AdminLM operator client secret","numUsesLimit":0,"ttl":0}' \
                 2>/dev/null || echo "000")
-            client_id=$(jq -r '.clientSecretData.id // empty' /tmp/infisical-ua.json 2>/dev/null || true)
+            # v0.166.2 response: {clientSecret, clientSecretData}. The clientId
+            # used at login is clientSecretData.identityUAId (the
+            # identity_universal_auth row's PK) — NOT clientSecretData.id
+            # (which is the client_secret row's PK; login's findOne({clientId})
+            # looks up the identityUa, not the secret).
+            client_id=$(jq -r '.clientSecretData.identityUAId // empty' /tmp/infisical-ua.json 2>/dev/null || true)
             client_secret=$(jq -r '.clientSecret // empty' /tmp/infisical-ua.json 2>/dev/null || true)
             if [ -z "$client_id" ] || [ -z "$client_secret" ]; then
                 log_warn "Operator client-secrets did not return clientId/clientSecret (HTTP $ua_resp)"
@@ -2649,7 +2654,10 @@ provision_infisical_agent_identity() {
         -d '{"description":"AdminLM agent client secret","numUsesLimit":0,"ttl":0}' \
         2>/dev/null || echo "000")
     # v0.166.2: clientId used at login = clientSecretData.id (NOT the identity id).
-    agent_client_id=$(jq -r '.clientSecretData.id // empty' /tmp/infisical-agent-ua.json 2>/dev/null || true)
+    # v0.166.2: clientId lives at clientSecretData.identityUAId — NOT
+    # clientSecretData.id (which is the client_secret row's PK). Same rationale
+    # as the operator path in 6b; login does identityUaDAL.findOne({clientId}).
+    agent_client_id=$(jq -r '.clientSecretData.identityUAId // empty' /tmp/infisical-agent-ua.json 2>/dev/null || true)
     agent_client_secret=$(jq -r '.clientSecret // empty' /tmp/infisical-agent-ua.json 2>/dev/null || true)
     if [ -z "$agent_client_id" ] || [ -z "$agent_client_secret" ]; then
         log_warn "Agent client-secrets did not return clientId/clientSecret (HTTP $agent_ua_resp)"

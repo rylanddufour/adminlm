@@ -293,7 +293,7 @@ def _read_secret(path: str, secret_key: str) -> dict:
 #          (no body) → enable universal-auth on the identity
 #   POST   /api/v1/auth/universal-auth/identities/{id}/client-secrets
 #          body: {"description": "...", "numUsesLimit": 0, "ttl": 0}
-#          → {clientSecret, clientSecretData: {id: clientId}}
+#          → {clientSecret, clientSecretData: {identityUAId: clientId}}
 #   POST   /api/v1/auth/universal-auth/login
 #          body: {"clientId": "...", "clientSecret": "..."}
 #          → {accessToken, tokenType, expiresIn}
@@ -380,8 +380,11 @@ def _add_universal_auth(mi_id: str) -> tuple[str, str]:
     """
     base = _infisical_url().rstrip("/")
     # v0.166.2: POST /api/v1/auth/universal-auth/identities/{id}/client-secrets
-    # → {clientSecret, clientSecretData}. The clientId used at login is
-    # clientSecretData.id — NOT the identity id.
+    # → {clientSecret, clientSecretData: {identityUAId, id, ...}}.
+    # The clientId used at login is clientSecretData.identityUAId (the
+    # identity_universal_auth row's PK) — NOT clientSecretData.id (which
+    # is THIS client_secret row's PK; login's findOne({clientId}) looks
+    # up the identityUa, not the secret).
     url = f"{base}/api/v1/auth/universal-auth/identities/{mi_id}/client-secrets"
     payload = {"description": "AdminLM agent client secret", "numUsesLimit": 0, "ttl": 0}
     resp = httpx.post(
@@ -394,7 +397,8 @@ def _add_universal_auth(mi_id: str) -> tuple[str, str]:
     body = resp.json()
     if isinstance(body, dict):
         data = body.get("clientSecretData") or {}
-        client_id = data.get("id") if isinstance(data, dict) else None
+        # clientId = identityUAId (NOT .id — that is the client_secret row's PK).
+        client_id = data.get("identityUAId") if isinstance(data, dict) else None
         return client_id or "", body.get("clientSecret") or ""
     return "", ""
 
