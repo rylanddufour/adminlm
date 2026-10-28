@@ -8,9 +8,20 @@
 #
 # Phase 3 (read-only MVP, committed aa44947):
 #   - Secret list under configurable path prefix (default /adminlm/it-systems/)
-#   - System-name filter from /api/v1/folders
 #   - Click-row to reveal value with st.toggle
-#   - GET /api/v3/secrets/* only — NO writes
+#   - GET /api/v4/secrets?projectId=... for LIST (v3 LIST is broken in
+#     Infisical v0.166.2 — returns {"secrets": []}); /api/v3/secrets/raw
+#     for single-secret reads (v3 raw GET still works)
+#   - NO writes — Phase 6 (BACKLOG #95) adds operator CRUD
+#
+# Phase 3.5 (2026-10-27, operator decision on .220 E2E):
+#   - v1.0 keeps secrets FLAT under /adminlm/it-systems/ — no nested
+#     folder hierarchy. Description field (secretComment) does the
+#     semantic grouping (e.g. "ssh key for all linux servers").
+#   - Replaced the folder-tree system filter with a search bar that
+#     does case-insensitive substring match against key OR description.
+#     For a small IT shop with ~10-20 secrets, search beats folder navigation.
+#   - Removed `_list_subfolders` call (no folders to enumerate in v1.0).
 #
 # Phase 4 (scope-policy UI for agent tokens, this commit):
 #   - "Agent tokens" tab: list + create + rotate + revoke machine identities
@@ -199,30 +210,36 @@ def _admin_headers() -> dict:
 def _list_secrets(path: str) -> list[dict]:
     """List secret METADATA under `path`. Never returns values.
 
-    Endpoint: GET /api/v3/secrets?workspaceId=...&environment=...&secretPath=...&recursive=true
-    Returns: list of {id, secretKey, secretPath, createdAt, updatedAt, version, ...}
+    Endpoint: GET /api/v4/secrets?projectId=...&environment=...&secretPath=...&recursive=true
+    Returns: list of {id, secretKey, secretPath, secretComment, createdAt, updatedAt, ...}
     Raises httpx.HTTPError on transport failure (caught below).
+
+    NOTE: The deprecated /api/v3/secrets LIST endpoint returns {"secrets": []}
+    in Infisical v0.166.2 even when secrets exist (verified on .220 2026-10-27).
+    The v3 raw GET (used by _read_secret for single-secret reads) still works.
+    The v4 LIST endpoint is the supported replacement and returns full
+    metadata including secretComment, which the table uses for the
+    Description column.
     """
     base = _infisical_url().rstrip("/")
     pid = _project_id()
     params = {
-        "workspaceId": pid,
+        "projectId": pid,
         "environment": INFISICAL_ENV_SLUG,
         "secretPath": path,
         # recursive=true: include secrets in nested folders under this path.
-        # Phase 3 lists every secret under /adminlm/it-systems/<system>/ so
-        # the operator sees them all without picking each system manually.
-        # Phase 4 scope-policy will tighten this; for now the operator
-        # token is scoped to /adminlm/* with read-only grants, so a
-        # broader recursive listing can't leak out-of-scope data.
+        # v1.0 keeps secrets FLAT under /adminlm/it-systems/ but recursive
+        # stays on so the page is forward-compatible if a customer adds
+        # nested folders later. Phase 6 (operator CRUD) writes to this
+        # path; the operator token is scoped to /adminlm/* read-only.
         "recursive": "true",
     }
-    url = f"{base}/api/v3/secrets?{urlencode(params)}"
+    url = f"{base}/api/v4/secrets?{urlencode(params)}"
     headers = {"Authorization": f"Bearer {_operator_token()}"}
     resp = httpx.get(url, headers=headers, timeout=_API_TIMEOUT_S)
     resp.raise_for_status()
     body = resp.json()
-    # v3 returns {"secrets": [...]}; some versions return a bare list.
+    # v4 returns {"secrets": [...], "imports": [...]}; we only want secrets.
     if isinstance(body, dict):
         return body.get("secrets") or body.get("data") or []
     if isinstance(body, list):
@@ -230,30 +247,9 @@ def _list_secrets(path: str) -> list[dict]:
     return []
 
 
-def _list_subfolders(path: str) -> list[dict]:
-    """List immediate subfolders of `path`. Used to populate the system filter.
-
-    Endpoint: GET /api/v1/folders?workspaceId=...&environment=...&path=...
-    Returns: list of {id, name, path, ...}
-    """
-    base = _infisical_url().rstrip("/")
-    pid = _project_id()
-    params = {
-        "workspaceId": pid,
-        "environment": INFISICAL_ENV_SLUG,
-        "path": path,
-    }
-    url = f"{base}/api/v1/folders?{urlencode(params)}"
-    headers = {"Authorization": f"Bearer {_operator_token()}"}
-    resp = httpx.get(url, headers=headers, timeout=_API_TIMEOUT_S)
-    resp.raise_for_status()
-    body = resp.json()
-    if isinstance(body, dict):
-        return body.get("folders") or body.get("data") or []
-    if isinstance(body, list):
-        return body
-    return []
-
+# NOTE: _list_subfolders() was removed in Phase 3.5 (2026-10-27). v1.0 keeps
+# secrets FLAT under /adminlm/it-systems/ so there's no folder hierarchy to
+# enumerate; the search bar replaces the previous folder-tree dropdown.
 
 def _read_secret(path: str, secret_key: str) -> dict:
     """Fetch a single secret including its VALUE for the reveal pane.
@@ -552,57 +548,23 @@ path_prefix = st.text_input(
     value=DEFAULT_PATH_PREFIX,
     key="secrets_path_prefix",
     help="Infisical secretPath to list under. Default /adminlm/it-systems/ "
-         "is the BACKLOG #94 customer-IT-secret scope. Phase 4 scope-policy "
-         "will restrict this; Phase 3 lets the operator change it freely.",
+         "is the BACKLOG #94 customer-IT-secret scope. v1.0 keeps secrets "
+         "FLAT under this path — the description field carries the system "
+         "grouping, so nested folders are not used.",
 )
 
-# System name filter — fetched from /api/v1/folders on every path change.
-# Cached for the lifetime of the session_state for this prefix so a
-# list/secrets reload doesn't re-hit the API.
-folders: list[dict] = []
-folders_error: str | None = None
-try:
-    folders = _list_subfolders(path_prefix)
-except httpx.HTTPStatusError as e:
-    folders_error = f"HTTP {e.response.status_code}: {e}"
-except httpx.HTTPError as e:
-    folders_error = f"transport error: {type(e).__name__}: {e}"
-except Exception as e:
-    folders_error = f"{type(e).__name__}: {e}"
-
-system_names = sorted(
-    {f.get("name", "") for f in folders if isinstance(f, dict) and f.get("name")}
+# Search filter — substring match against key OR description (secretComment).
+# Replaces the previous folder-tree system filter; v1.0 is FLAT so there's
+# no folder hierarchy to navigate. For a small IT shop with ~10-20 secrets,
+# a search bar beats a folder dropdown. Phase 4 scope-policy stays the same.
+search_query = st.text_input(
+    "Search",
+    value="",
+    key="secrets_search_query",
+    placeholder="filter by key or description (e.g. ssh, AD, stripe)",
+    help="Case-insensitive substring match on secretKey or secretComment. "
+         "Empty = show everything under the path prefix.",
 )
-
-if folders_error:
-    st.warning(
-        f"⚠️ Cannot list folders under `{path_prefix}`: {folders_error}. "
-        "The secret list below still works against the same upstream."
-    )
-
-if system_names:
-    # "" = no filter (show everything under path_prefix).
-    system_filter_options = ["(all)"] + system_names
-    system_filter = st.selectbox(
-        "System name",
-        options=system_filter_options,
-        index=0,
-        key="secrets_system_filter",
-        help="Filter the secret list to one system (subfolder). "
-             "Phase 5 (MCP tools) and Phase 6 (operator CRUD) populate these.",
-    )
-else:
-    if folders_error:
-        # Subfolders call failed — list might still be OK; we just can't
-        # pre-populate the dropdown. Render an inert hint instead.
-        st.caption("📁 No systems configured yet (or folders API unreachable).")
-    else:
-        st.info(
-            "📁 **No systems configured yet.** "
-            "The list below is empty until Phase 5 (agent MCP tools) and "
-            "Phase 6 (operator CRUD) populate secrets under this path prefix."
-        )
-    system_filter = "(all)"
 
 
 # ---------------------------------------------------------------------------
@@ -611,13 +573,8 @@ else:
 
 section_header("Secrets")
 
-# Build the effective secretPath the user is browsing.
-# (all) → use the bare prefix. Otherwise → <prefix><system_filter> with a
-# trailing slash so secrets directly under the system folder are listed.
-if system_filter == "(all)" or not system_filter:
-    browse_path = path_prefix.rstrip("/")
-else:
-    browse_path = path_prefix.rstrip("/") + "/" + system_filter
+# v1.0 keeps secrets FLAT under path_prefix — no system subfolder logic.
+browse_path = path_prefix.rstrip("/")
 
 secrets_rows: list[dict] = []
 list_error: str | None = None
@@ -637,25 +594,50 @@ if list_error:
         "(Infisical URL) and the operator token."
     )
 else:
+    # Apply the search filter AFTER the list call so we get full
+    # metadata (including secretComment) for the in-memory filter.
+    # Substring match on key OR description; empty query = show all.
+    needle = search_query.strip().lower()
+    if needle:
+        secrets_rows = [
+            r for r in secrets_rows
+            if isinstance(r, dict) and (
+                needle in r.get("secretKey", "").lower()
+                or needle in (r.get("secretComment") or "").lower()
+            )
+        ]
+
     if not secrets_rows:
-        st.caption(
-            f"No secrets at `{browse_path}`. "
-            "Phase 5 (agent MCP) + Phase 6 (operator CRUD) will populate this."
-        )
+        if needle:
+            st.caption(
+                f"No secrets under `{browse_path}` match `{search_query}`. "
+                "Try a different search term."
+            )
+        else:
+            st.caption(
+                f"No secrets at `{browse_path}`. "
+                "Phase 6 (operator CRUD) will populate this."
+            )
     else:
-        # Build a stable, sorted display — alphabetical by (path, key).
-        # `updatedAt` is the Infisical v3 last-modified timestamp (ISO-8601).
+        # Build a stable, sorted display — alphabetical by Key.
+        # The Description column (secretComment) is the operator-facing
+        # context; the Key is what the agent references; Updated is
+        # the v4 last-modified timestamp (ISO-8601).
+        #
+        # v1.0 is FLAT under path_prefix so we don't render a Path
+        # column (it's always the same). The view-pane re-uses
+        # `path_prefix` for the read call.
         display_rows = sorted(
             [
                 {
-                    "Secret Key": r.get("secretKey", ""),
-                    "Path": r.get("secretPath", ""),
-                    "Last Updated": r.get("updatedAt", ""),
+                    "Description": r.get("secretComment") or "_(no description)_",
+                    "Key": r.get("secretKey", ""),
+                    "Updated": r.get("updatedAt", ""),
                 }
                 for r in secrets_rows
                 if isinstance(r, dict)
             ],
-            key=lambda r: (r["Path"], r["Secret Key"]),
+            key=lambda r: r["Key"],
         )
 
         # Streamlit >=1.30 supports on_select="rerun" + selection_mode="single-row"
@@ -674,9 +656,9 @@ else:
             key="secrets_table",
         )
 
-        # -------------------------------------------------------------------
+        # ------------------------------------------------------------------
         # View pane — click row → reveal with st.toggle
-        # -------------------------------------------------------------------
+        # ------------------------------------------------------------------
         section_header("View pane")
 
         selected_idx: list[int] = []
@@ -692,16 +674,20 @@ else:
 
         reveal = False
         chosen: dict | None = None
+        chosen_key: str = ""
+        chosen_path: str = path_prefix.rstrip("/")
 
         if selected_idx:
             chosen = display_rows[selected_idx[0]]
+            chosen_key = chosen["Key"]
+            # v1.0 path is the operator's path_prefix; v1.0 secrets are flat.
             # Audit the view BEFORE showing the value so the event timestamp
             # reflects the reveal moment, not the table render.
-            _audit_view(chosen["Secret Key"], chosen["Path"])
+            _audit_view(chosen_key, chosen_path)
             reveal = st.toggle(
                 "Reveal value",
                 value=False,
-                key=f"reveal_{chosen['Path']}_{chosen['Secret Key']}",
+                key=f"reveal_{chosen_path}_{chosen_key}",
                 help="On = show the secret value (will be audit-logged). "
                      "Off = mask with ••••.",
             )
@@ -718,35 +704,37 @@ else:
             value: str = ""
             masked: str = "(empty)"
             try:
-                raw = _read_secret(chosen["Path"], chosen["Secret Key"])
+                raw = _read_secret(chosen_path, chosen_key)
                 value = raw.get("secretValue", "")
                 masked = "•" * 12 if value else "(empty)"
             except httpx.HTTPStatusError as e:
                 st.error(
-                    f"❌ Cannot read `{chosen['Secret Key']}` at "
-                    f"`{chosen['Path']}`: HTTP {e.response.status_code}. "
+                    f"❌ Cannot read `{chosen_key}` at "
+                    f"`{chosen_path}`: HTTP {e.response.status_code}. "
                     "The list endpoint may have broader visibility than "
                     "the raw endpoint (scope-policy tightening, Phase 4)."
                 )
                 raw = {}
             except httpx.HTTPError as e:
                 st.error(
-                    f"❌ Cannot read `{chosen['Secret Key']}`: "
+                    f"❌ Cannot read `{chosen_key}`: "
                     f"transport error: {e}"
                 )
                 raw = {}
             except Exception as e:
                 st.error(
-                    f"❌ Cannot read `{chosen['Secret Key']}`: "
+                    f"❌ Cannot read `{chosen_key}`: "
                     f"{type(e).__name__}: {e}"
                 )
                 raw = {}
             # Render whatever we got — if the try succeeded, `value`
             # holds the real secret; if it failed, `value` is "" and
             # we just show the masked hint.
+            chosen_desc = chosen.get("Description") or "_(no description)_"
             st.markdown(
-                f"**Secret:** `{chosen['Secret Key']}`  \n"
-                f"**Path:** `{chosen['Path']}`  \n"
+                f"**Description:** {chosen_desc}  \n"
+                f"**Secret:** `{chosen_key}`  \n"
+                f"**Path:** `{chosen_path}`  \n"
                 f"**Value:** `{value or masked}`"
             )
             if raw.get("secretComment"):
@@ -754,9 +742,11 @@ else:
             if raw.get("updatedAt"):
                 st.caption(f"🕒 Updated: {raw['updatedAt']}")
         elif chosen and not reveal:
+            chosen_desc = chosen.get("Description") or "_(no description)_"
             st.markdown(
-                f"**Secret:** `{chosen['Secret Key']}`  \n"
-                f"**Path:** `{chosen['Path']}`  \n"
+                f"**Description:** {chosen_desc}  \n"
+                f"**Secret:** `{chosen_key}`  \n"
+                f"**Path:** `{chosen_path}`  \n"
                 f"**Value:** `••••••••••••` _(toggle above to reveal — "
                 "audit-logged)_"
             )
