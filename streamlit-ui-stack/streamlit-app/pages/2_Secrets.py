@@ -541,22 +541,9 @@ if not _project_id():
 
 section_header("Filters")
 
-# Default path prefix: /adminlm/it-systems/ per BACKLOG #94 AC.
-# Operator can override to inspect a non-customer-IT vault.
-path_prefix = st.text_input(
-    "Path prefix",
-    value=DEFAULT_PATH_PREFIX,
-    key="secrets_path_prefix",
-    help="Infisical secretPath to list under. Default /adminlm/it-systems/ "
-         "is the BACKLOG #94 customer-IT-secret scope. v1.0 keeps secrets "
-         "FLAT under this path — the description field carries the system "
-         "grouping, so nested folders are not used.",
-)
-
 # Search filter — substring match against key OR description (secretComment).
-# Replaces the previous folder-tree system filter; v1.0 is FLAT so there's
-# no folder hierarchy to navigate. For a small IT shop with ~10-20 secrets,
-# a search bar beats a folder dropdown. Phase 4 scope-policy stays the same.
+# Primary filter, always visible. For a small IT shop with ~10-20 secrets,
+# search beats folder navigation. Phase 4 scope-policy stays the same.
 search_query = st.text_input(
     "Search",
     value="",
@@ -565,6 +552,20 @@ search_query = st.text_input(
     help="Case-insensitive substring match on secretKey or secretComment. "
          "Empty = show everything under the path prefix.",
 )
+
+# Path prefix — hidden in a collapsed expander. v1.0 keeps secrets FLAT
+# under /adminlm/it-systems/, so the operator rarely needs to change this.
+# Power users / debugging can expand to point at a different subtree.
+with st.expander("Advanced: path prefix", expanded=False):
+    path_prefix = st.text_input(
+        "Path prefix",
+        value=DEFAULT_PATH_PREFIX,
+        key="secrets_path_prefix",
+        help="Infisical secretPath to list under. Default /adminlm/it-systems/ "
+             "is the BACKLOG #94 customer-IT-secret scope. v1.0 keeps secrets "
+             "FLAT under this path — the description field carries the system "
+             "grouping, so nested folders are not used.",
+    )
 
 
 # ---------------------------------------------------------------------------
