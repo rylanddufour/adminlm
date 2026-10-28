@@ -553,19 +553,12 @@ search_query = st.text_input(
          "Empty = show everything under the path prefix.",
 )
 
-# Path prefix — hidden in a collapsed expander. v1.0 keeps secrets FLAT
-# under /adminlm/it-systems/, so the operator rarely needs to change this.
-# Power users / debugging can expand to point at a different subtree.
-with st.expander("Advanced: path prefix", expanded=False):
-    path_prefix = st.text_input(
-        "Path prefix",
-        value=DEFAULT_PATH_PREFIX,
-        key="secrets_path_prefix",
-        help="Infisical secretPath to list under. Default /adminlm/it-systems/ "
-             "is the BACKLOG #94 customer-IT-secret scope. v1.0 keeps secrets "
-             "FLAT under this path — the description field carries the system "
-             "grouping, so nested folders are not used.",
-    )
+# Path prefix is hard-coded to DEFAULT_PATH_PREFIX in v1.0 (operator decision
+# 2026-10-27). The previous UI input — even hidden behind an expander — gave
+# operators the false impression that browsing other paths was supported. v1.0
+# is FLAT under /adminlm/it-systems/ and the operator never needs to change
+# it. If a future v2.x re-introduces multi-scope browsing, add the UI here.
+path_prefix: str = DEFAULT_PATH_PREFIX
 
 
 # ---------------------------------------------------------------------------
