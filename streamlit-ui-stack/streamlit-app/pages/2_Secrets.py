@@ -355,7 +355,15 @@ def _update_secret(path: str, key: str, value: str,
         "type": "shared",
     }
     if comment is not None:
-        body["secretReminderNote"] = comment  # PATCH supports reminder note
+        # PATCH /api/v4/secrets/{key} accepts `secretComment` (the
+        # description field). Verified on v0.166.2 — the handler reads
+        # `secretComment: req.body.secretComment` and passes it to
+        # `updateSecretRaw`. The schema also accepts `secretReminderNote`
+        # but that's a separate field (cadence/reminder feature), NOT
+        # the human description. Earlier versions of this helper sent
+        # `secretReminderNote` and the comment silently didn't update
+        # — fixed 2026-10-28.
+        body["secretComment"] = comment
     resp = httpx.patch(
         url,
         json=body,
