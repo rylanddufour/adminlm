@@ -266,6 +266,13 @@ def get_secret(secret_path: str, secret_key: str) -> dict:
     }
     try:
         data = _get_json(url, params)
+    except httpx.HTTPStatusError as e:
+        # 404 → secret_not_found (BACKLOG #94 AC#7 discovery flow).
+        # 401/403 → agent_token_unauthorized. Other 4xx/5xx → generic.
+        # _http_error MUST be matched BEFORE the general httpx.HTTPError
+        # below because HTTPStatusError is a subclass of HTTPError.
+        return _http_error("get_secret", secret_path, secret_key,
+                           e.response.status_code, e.response.text)
     except httpx.HTTPError as e:
         return _transport_error("get_secret", secret_path, secret_key, e)
     except Exception as e:
@@ -319,15 +326,24 @@ def list_paths(path_prefix: str = DEFAULT_PATH_PREFIX) -> list[dict]:
                         success=False, error="config_missing")
         return [cfg_err]
 
-    url = f"{INFISICAL_URL}/api/v3/secrets"
+    # Endpoint note (verified on Infisical v0.166.2):
+    #   The deprecated /api/v3/secrets LIST returns {"secrets": []} even
+    #   when secrets exist. The supported replacement is /api/v4/secrets
+    #   with `projectId` (not `workspaceId`). Mirrors the same fix in
+    #   streamlit-ui-stack/streamlit-app/pages/2_Secrets.py — keep these
+    #   two in lockstep when bumping Infisical versions.
+    url = f"{INFISICAL_URL}/api/v4/secrets"
     params = {
-        "workspaceId": INFISICAL_PROJECT_ID,
+        "projectId": INFISICAL_PROJECT_ID,
         "environment": INFISICAL_ENVIRONMENT,
         "secretPath": path_prefix,
         "recursive": "true",
     }
     try:
         data = _get_json(url, params)
+    except httpx.HTTPStatusError as e:
+        return [_http_error("list_paths", path_prefix, None,
+                            e.response.status_code, e.response.text)]
     except httpx.HTTPError as e:
         return [_transport_error("list_paths", path_prefix, None, e)]
     except Exception as e:
@@ -363,22 +379,27 @@ def list_paths(path_prefix: str = DEFAULT_PATH_PREFIX) -> list[dict]:
 def list_systems(path_prefix: str = DEFAULT_PATH_PREFIX) -> list[Any]:
     """Enumerate unique system folder names under a path prefix. READ-ONLY.
 
-    Use this when the agent doesn't know what systems exist. Returns
-    the sorted unique folder-name list (e.g. ["ad", "ssh", "vmware"]).
-    Folders are Infisical's organization unit; each system has its own
-    folder with the customer's IT credentials inside. Strict read-only
-    contract — no secret values are read or returned.
+    DEPRECATED in v1.0 flat layout (operator decision 2026-10-27).
+    v1.0 keeps secrets FLAT under /adminlm/it-systems/ — there are no
+    subfolders to enumerate. This tool will return [] for any v1.0 vault.
+    Kept in the tool surface (rather than removed) so the agent's tool
+    list stays stable; if a future v2.x re-introduces nested folders,
+    this tool starts returning useful data again without code changes.
+
+    Use list_paths() for discovery in v1.0 — it returns the same info
+    (key + path + updatedAt) without relying on folder structure.
 
     Args:
         path_prefix: Infisical folder path to scan recursively. Default
             "/adminlm/it-systems/" scans the entire customer IT subtree.
 
     Returns:
-        Sorted unique list[str] of system names. On failure: a
-        single-element list containing a {error, ...} dict — the agent
-        can pattern-match len() == 1 and the first element's "error"
-        key. NEVER an exception / traceback. The annotation is list[Any]
-        because the failure element is a dict, not a str.
+        Sorted unique list[str] of system folder names. Will be [] in
+        v1.0 flat layout. On failure: a single-element list containing
+        a {error, ...} dict — the agent can pattern-match len() == 1
+        and the first element's "error" key. NEVER an exception /
+        traceback. The annotation is list[Any] because the failure
+        element is a dict, not a str.
     """
     cfg_err = _require_config()
     if cfg_err is not None:
@@ -398,6 +419,9 @@ def list_systems(path_prefix: str = DEFAULT_PATH_PREFIX) -> list[Any]:
     }
     try:
         data = _get_json(url, params)
+    except httpx.HTTPStatusError as e:
+        return [_http_error("list_systems", path_prefix, None,
+                            e.response.status_code, e.response.text)]  # type: ignore[list-item]
     except httpx.HTTPError as e:
         return [_transport_error("list_systems", path_prefix, None, e)]  # type: ignore[list-item]
     except Exception as e:
