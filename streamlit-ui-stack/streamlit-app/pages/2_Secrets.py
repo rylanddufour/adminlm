@@ -1,4 +1,4 @@
-# pages/2_Secrets.py — BACKLOG #94 Phase 3 + Phase 4.
+# pages/2_Secrets.py — BACKLOG #94 Phase 3 + Phase 4 + Phase 6.
 #
 # Operator-facing view of the Infisical vault. The Streamlit page IS
 # the only surface the operator ever touches; the Infisical UI itself
@@ -12,7 +12,6 @@
 #   - GET /api/v4/secrets?projectId=... for LIST (v3 LIST is broken in
 #     Infisical v0.166.2 — returns {"secrets": []}); /api/v3/secrets/raw
 #     for single-secret reads (v3 raw GET still works)
-#   - NO writes — Phase 6 (BACKLOG #95) adds operator CRUD
 #
 # Phase 3.5 (2026-10-27, operator decision on .220 E2E):
 #   - v1.0 keeps secrets FLAT under /adminlm/it-systems/ — no nested
@@ -23,7 +22,7 @@
 #     For a small IT shop with ~10-20 secrets, search beats folder navigation.
 #   - Removed `_list_subfolders` call (no folders to enumerate in v1.0).
 #
-# Phase 4 (scope-policy UI for agent tokens, this commit):
+# Phase 4 (scope-policy UI for agent tokens):
 #   - "Agent tokens" tab: list + create + rotate + revoke machine identities
 #   - Used by the agent at runtime (Phase 5 infisical-mcp will fetch tokens from here)
 #   - Uses INFISICAL_ADMIN_TOKEN (bootstrap-time root admin JWT) for create/rotate/revoke
@@ -32,12 +31,24 @@
 #   - Created/rotated tokens shown ONCE in st.code() for copy
 #   - Audit: streamlit_token_{create,rotate,revoke} events to Loki (no token VALUE)
 #
-# NOT in v1.0: write/update/delete/rotate for SECRETS (Phase 6); infisical-mcp
-# server (Phase 5); path-scoped (per-folder) machine-identity permissions — the
-# Infisical v0.166.2 role-grant API is project-wide only; folder-scoped grants
-# require a custom-role + permission-filters API which is documented but not
-# stable in v0.166.2. Tracked as a v1.x follow-up. Agent tokens in v1.0 are
-# project-wide read-only — same scope as the operator token.
+# Phase 6 (BACKLOG #95, operator CRUD):
+#   - Add Secret button → modal: key + description + value
+#   - Edit button per row → pre-fills description (value pre-fills if revealed)
+#   - Delete button per row → typed-confirmation modal ("DELETE" to confirm)
+#   - Rotate is covered by Edit — operator supplies new value (matches
+#     BACKLOG #94 "operator-driven means operator decides the value")
+#   - All writes use INFISICAL_ADMIN_TOKEN via POST /api/v4/secrets/{key},
+#     PATCH /api/v4/secrets/{key}, DELETE /api/v4/secrets/{key} (soft-delete)
+#   - Audit: streamlit_secret_{create,update,delete} events to Loki
+#     (NEVER the secret value — only metadata)
+#
+# NOT in v1.0: per-secret rotation cadence, page-local audit log viewer
+# (deferred to Phase 7 GA wave), path-scoped (per-folder) machine-identity
+# permissions — the Infisical v0.166.2 role-grant API is project-wide only;
+# folder-scoped grants require a custom-role + permission-filters API which
+# is documented but not stable in v0.166.2. Tracked as a v1.x follow-up.
+# Agent tokens in v1.0 are project-wide read-only — same scope as the
+# operator token.
 #
 # Auth: require_auth() (auth.py). Streamlit admin login is NOT used to
 # talk to Infisical — the operator token (INFISICAL_OPERATOR_TOKEN) is
@@ -60,7 +71,7 @@
 from __future__ import annotations
 
 import os
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import httpx
 import streamlit as st
@@ -270,6 +281,148 @@ def _read_secret(path: str, secret_key: str) -> dict:
     resp = httpx.get(url, headers=headers, timeout=_API_TIMEOUT_S)
     resp.raise_for_status()
     return resp.json()
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 (BACKLOG #95) — operator CRUD API helpers
+# ---------------------------------------------------------------------------
+#
+# Writes use INFISICAL_ADMIN_TOKEN (the bootstrap-time root admin JWT), NOT
+# the operator token. The operator token has the project `viewer` role for
+# reads; writes require admin scope (mirrors Phase 4's pattern for managing
+# machine-identity tokens on this same page).
+#
+# Endpoint shape verified against Infisical v0.166.2:
+#   POST   /api/v4/secrets/{key}   body: {projectId, environment,
+#                                     secretPath, secretValue, secretComment?, type?}
+#   PATCH  /api/v4/secrets/{key}   body: {projectId, environment,
+#                                     secretPath?, secretValue?, secretReminderNote?, type?}
+#   DELETE /api/v4/secrets/{key}   body: {projectId, environment,
+#                                     secretPath, type?}
+# All three use `projectId` (not `workspaceId` as the v3 deprecation note
+# suggests) — `workspaceId` in v3 was renamed to `projectId` in v4.
+# `secretPath` has a `removeTrailingSlash` transform on the server side, so
+# we pass it without the trailing "/" (e.g. "/adminlm/it-systems" not
+# "/adminlm/it-systems/"). `type` defaults to "shared" on the server.
+
+def _create_secret(path: str, key: str, value: str,
+                   comment: str = "") -> dict:
+    """Create a new secret at `path`. Operator-only (uses admin token).
+
+    Returns: the response JSON from Infisical on success.
+    Raises httpx.HTTPError on transport / status failure (caught by UI).
+    """
+    base = _infisical_url().rstrip("/")
+    url = f"{base}/api/v4/secrets/{quote(key, safe='')}"
+    body = {
+        "projectId": _project_id(),
+        "environment": INFISICAL_ENV_SLUG,
+        "secretPath": path.rstrip("/"),
+        "secretValue": value,
+        "type": "shared",
+    }
+    if comment:
+        body["secretComment"] = comment
+    resp = httpx.post(
+        url,
+        json=body,
+        headers={**_admin_headers(), "Content-Type": "application/json"},
+        timeout=_API_TIMEOUT_S,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _update_secret(path: str, key: str, value: str,
+                   comment: str | None = None) -> dict:
+    """Update an existing secret at `path`. Operator-only (uses admin token).
+
+    PATCH supports partial updates — both `secretValue` and
+    `secretComment` are optional. We send both here so the operator's
+    description and value stay in sync (matches the "operator drives the
+    value + meaning" intent from BACKLOG #94).
+
+    `comment=None` means "don't change it"; empty string clears it.
+    To clear the description explicitly, the UI should pass `comment=""`.
+    """
+    base = _infisical_url().rstrip("/")
+    url = f"{base}/api/v4/secrets/{quote(key, safe='')}"
+    body: dict = {
+        "projectId": _project_id(),
+        "environment": INFISICAL_ENV_SLUG,
+        "secretPath": path.rstrip("/"),
+        "secretValue": value,
+        "type": "shared",
+    }
+    if comment is not None:
+        body["secretReminderNote"] = comment  # PATCH supports reminder note
+    resp = httpx.patch(
+        url,
+        json=body,
+        headers={**_admin_headers(), "Content-Type": "application/json"},
+        timeout=_API_TIMEOUT_S,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _delete_secret(path: str, key: str) -> None:
+    """Soft-delete a secret at `path`. Operator-only (uses admin token).
+
+    Infisical's DELETE is a soft-delete — the secret is hidden but retained
+    for audit (BACKLOG #94: "Delete uses Infisical's soft-delete (retains
+    for audit)"). Page reloads via list_paths() will not show it.
+    """
+    base = _infisical_url().rstrip("/")
+    url = f"{base}/api/v4/secrets/{quote(key, safe='')}"
+    body = {
+        "projectId": _project_id(),
+        "environment": INFISICAL_ENV_SLUG,
+        "secretPath": path.rstrip("/"),
+        "type": "shared",
+    }
+    resp = httpx.request(
+        "DELETE",
+        url,
+        json=body,
+        headers={**_admin_headers(), "Content-Type": "application/json"},
+        timeout=_API_TIMEOUT_S,
+    )
+    # 404 on already-deleted is fine — operator-initiated delete is
+    # idempotent in spirit.
+    if resp.status_code not in (200, 202, 204, 404):
+        resp.raise_for_status()
+
+
+# ---------------------------------------------------------------------------
+# Audit helper — operator secret CRUD (BACKLOG #77 loki_logger pattern)
+# ---------------------------------------------------------------------------
+#
+# Mirrors `_audit_token` for machine-identity actions. Emits one NDJSON line
+# to ~/.hermes/logs/streamlit/*.log per create/update/delete. Loki label
+# {job="streamlit", source="adminlm_host"} matches the dashboard tile.
+# Audit fields: {event, user_id, username, secret_key, secret_path, ts};
+# NEVER includes the secret VALUE.
+
+def _audit_secret(action: str, secret_key: str, secret_path: str) -> None:
+    """Emit a streamlit_secret_{action} event to Loki. NEVER the secret value.
+
+    `action` is one of: 'create', 'update', 'delete'. Failures swallowed
+    so a Loki outage never blocks the operator's UX (same pattern as
+    _audit_view and _audit_token on this page).
+    """
+    try:
+        from loki_logger import log_event
+        log_event("streamlit", {
+            "event": f"streamlit_secret_{action}",
+            "user_id": st.session_state.get("user_id"),
+            "username": st.session_state.get("user"),
+            "secret_key": secret_key,
+            "secret_path": secret_path,
+            # ts is added by log_event itself (RFC3339Nano); don't duplicate.
+        })
+    except Exception:
+        pass  # logging failures must never block a successful op
 
 
 # ---------------------------------------------------------------------------
@@ -570,6 +723,65 @@ section_header("Secrets")
 # v1.0 keeps secrets FLAT under path_prefix — no system subfolder logic.
 browse_path = path_prefix.rstrip("/")
 
+# ---------------------------------------------------------------------------
+# Add Secret — popover with inline form (Phase 6, BACKLOG #95)
+# ---------------------------------------------------------------------------
+# Uses INFISICAL_ADMIN_TOKEN (mirrors the agent-tokens section below).
+# Path is fixed to path_prefix (v1.0 is flat); operator can override via the
+# Advanced expander hidden earlier in the page. Form clears on submit.
+add_col, _ = st.columns([1, 6])
+with add_col:
+    with st.popover("➕ Add Secret", use_container_width=False):
+        if not _admin_token():
+            st.error("❌ `INFISICAL_ADMIN_TOKEN` is empty in this "
+                     "container. Re-run `bootstrap.sh deploy_infisical_stack` "
+                     "and restart the streamlit-ui container.")
+        else:
+            with st.form("add_secret_form", clear_on_submit=True):
+                st.caption(f"Path: `{browse_path}` (v1.0 is FLAT)")
+                new_key = st.text_input(
+                    "Key",
+                    placeholder="e.g. STRIPE_API_KEY",
+                    help="Uppercase with underscores. Used by the agent. "
+                         "Must be unique under the path.",
+                )
+                new_comment = st.text_input(
+                    "Description",
+                    placeholder="e.g. Stripe API key for billing",
+                    help="Free-text context for the operator. Shown as "
+                         "the leading column in the Secrets table.",
+                )
+                new_value = st.text_area(
+                    "Value",
+                    placeholder="the actual secret value",
+                    help="Multi-line OK (e.g. SSH private keys).",
+                )
+                submitted = st.form_submit_button("Create")
+                if submitted:
+                    if not new_key.strip():
+                        st.error("❌ Key is required.")
+                    elif not new_value:
+                        st.error("❌ Value is required.")
+                    else:
+                        try:
+                            _create_secret(
+                                browse_path, new_key.strip(),
+                                new_value, new_comment.strip(),
+                            )
+                            _audit_secret("create", new_key.strip(), browse_path)
+                            st.success(f"✅ Created `{new_key.strip()}`.")
+                            st.rerun()
+                        except httpx.HTTPStatusError as e:
+                            st.error(
+                                f"❌ Create failed: HTTP {e.response.status_code}. "
+                                "The key may already exist — try Edit instead, "
+                                "or use a different key name."
+                            )
+                        except httpx.HTTPError as e:
+                            st.error(f"❌ Transport error: {e}")
+                        except Exception as e:
+                            st.error(f"❌ {type(e).__name__}: {e}")
+
 secrets_rows: list[dict] = []
 list_error: str | None = None
 try:
@@ -670,6 +882,10 @@ else:
         chosen: dict | None = None
         chosen_key: str = ""
         chosen_path: str = path_prefix.rstrip("/")
+        # Hoisted to outer scope so the Edit button (below) can pre-fill
+        # the value field when reveal is on. Empty string when reveal
+        # is off (operator must type the new value to save).
+        chosen_value: str = ""
 
         if selected_idx:
             chosen = display_rows[selected_idx[0]]
@@ -700,6 +916,7 @@ else:
             try:
                 raw = _read_secret(chosen_path, chosen_key)
                 value = raw.get("secretValue", "")
+                chosen_value = value  # hoisted so Edit button can pre-fill
                 masked = "•" * 12 if value else "(empty)"
             except httpx.HTTPStatusError as e:
                 st.error(
@@ -744,6 +961,132 @@ else:
                 f"**Value:** `••••••••••••` _(toggle above to reveal — "
                 "audit-logged)_"
             )
+
+        # ------------------------------------------------------------------
+        # Edit + Delete (Phase 6, BACKLOG #95) — show whenever a row
+        # is selected, regardless of reveal state. Mirrors the agent-
+        # tokens section's pattern (typed-confirmation per BACKLOG #25).
+        # ------------------------------------------------------------------
+        if chosen is not None:
+            edit_col, del_col = st.columns(2)
+            with edit_col:
+                with st.popover("✏️ Edit"):
+                    if not _admin_token():
+                        st.error("❌ `INFISICAL_ADMIN_TOKEN` is empty — "
+                                 "cannot edit secrets.")
+                    else:
+                        with st.form(f"edit_{chosen_path}_{chosen_key}",
+                                     clear_on_submit=False):
+                            st.caption(
+                                f"Key: `{chosen_key}` _(cannot change)_  \n"
+                                f"Path: `{chosen_path}`"
+                            )
+                            edit_comment = st.text_input(
+                                "Description",
+                                value=chosen.get("Description") or "",
+                                key=f"edit_comment_{chosen_path}_{chosen_key}",
+                            )
+                            edit_value = st.text_area(
+                                "Value",
+                                value=chosen_value,
+                                key=f"edit_value_{chosen_path}_{chosen_key}",
+                                help=(
+                                    "Pre-filled when value is revealed. "
+                                    "Leave blank to keep current value."
+                                    if chosen_value else
+                                    "Reveal the value above first to "
+                                    "pre-fill, or type the new value."
+                                ),
+                            )
+                            if st.form_submit_button("Save changes"):
+                                # If operator left value blank, PATCH only
+                                # the comment (keep current value).
+                                # Otherwise PATCH both value + comment.
+                                if not edit_value.strip():
+                                    # Value blank → only update comment.
+                                    try:
+                                        _update_secret(
+                                            chosen_path, chosen_key,
+                                            chosen_value or "",
+                                            comment=edit_comment.strip(),
+                                        )
+                                        _audit_secret("update", chosen_key,
+                                                       chosen_path)
+                                        st.success(
+                                            f"✅ Updated description for "
+                                            f"`{chosen_key}`."
+                                        )
+                                        st.rerun()
+                                    except httpx.HTTPStatusError as e:
+                                        st.error(
+                                            f"❌ HTTP {e.response.status_code}: "
+                                            f"{e.response.text[:200]}"
+                                        )
+                                    except httpx.HTTPError as e:
+                                        st.error(f"❌ Transport error: {e}")
+                                    except Exception as e:
+                                        st.error(
+                                            f"❌ {type(e).__name__}: {e}"
+                                        )
+                                else:
+                                    try:
+                                        _update_secret(
+                                            chosen_path, chosen_key,
+                                            edit_value,
+                                            comment=edit_comment.strip(),
+                                        )
+                                        _audit_secret("update", chosen_key,
+                                                       chosen_path)
+                                        st.success(
+                                            f"✅ Updated `{chosen_key}`."
+                                        )
+                                        st.rerun()
+                                    except httpx.HTTPStatusError as e:
+                                        st.error(
+                                            f"❌ HTTP {e.response.status_code}: "
+                                            f"{e.response.text[:200]}"
+                                        )
+                                    except httpx.HTTPError as e:
+                                        st.error(f"❌ Transport error: {e}")
+                                    except Exception as e:
+                                        st.error(
+                                            f"❌ {type(e).__name__}: {e}"
+                                        )
+            with del_col:
+                with st.popover(f"🗑️ Delete {chosen_key}"):
+                    st.warning(
+                        f"⚠️ Will **soft-delete** `{chosen_key}` at "
+                        f"`{chosen_path}`. The secret is hidden but "
+                        f"retained for audit. Type DELETE to confirm."
+                    )
+                    confirm_text = st.text_input(
+                        "Type DELETE to confirm",
+                        key=f"confirm_del_{chosen_path}_{chosen_key}",
+                    )
+                    if st.button(
+                        "Confirm delete",
+                        key=f"confirm_del_btn_{chosen_path}_{chosen_key}",
+                    ):
+                        if confirm_text.strip() != "DELETE":
+                            st.error("❌ Confirmation text does not match.")
+                        else:
+                            try:
+                                _delete_secret(chosen_path, chosen_key)
+                                _audit_secret("delete", chosen_key,
+                                               chosen_path)
+                                st.success(f"✅ Deleted `{chosen_key}`.")
+                                st.rerun()
+                            except httpx.HTTPStatusError as e:
+                                st.error(
+                                    f"❌ HTTP {e.response.status_code}: "
+                                    f"{e.response.text[:200]}"
+                                )
+                            except httpx.HTTPError as e:
+                                st.error(f"❌ Transport error: {e}")
+                            except Exception as e:
+                                st.error(
+                                    f"❌ {type(e).__name__}: {e}"
+                                )
 
 
 # ============================================================================
