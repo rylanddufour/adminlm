@@ -554,6 +554,7 @@ _PAGE_ICONS: dict[str, str] = {
     "run_detail":      "manage_search",      # search/inspect
     "kb_search":       "lightbulb",          # knowledge (NOT a stack of books)
     "inventory_search": "deployed_code",      # hexagon grid of devices
+    "secrets":         "lock",               # padlock (customer IT credentials)
 }
 
 # Inline glyph helper. Returns the HTML for a Material Symbols

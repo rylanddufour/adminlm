@@ -726,7 +726,7 @@ path_prefix: str = DEFAULT_PATH_PREFIX
 # Secret list (metadata only — no VALUES in the table per BACKLOG #94 AC)
 # ---------------------------------------------------------------------------
 
-section_header("Secrets")
+section_header("Customer secrets")
 
 # v1.0 keeps secrets FLAT under path_prefix — no system subfolder logic.
 browse_path = path_prefix.rstrip("/")
@@ -780,10 +780,16 @@ with add_col:
                             st.success(f"✅ Created `{new_key.strip()}`.")
                             st.rerun()
                         except httpx.HTTPStatusError as e:
+                            # Infisical returns 400 on duplicate key
+                            # ("Secret 'foo' already exists in path '...'")
+                            # — surface the server's actual message so
+                            # the operator sees the exact reason. The
+                            # path/env in the message are operator-known
+                            # (they just typed them), no info leak.
                             st.error(
-                                f"❌ Create failed: HTTP {e.response.status_code}. "
-                                "The key may already exist — try Edit instead, "
-                                "or use a different key name."
+                                f"❌ Cannot create `{new_key.strip()}` "
+                                f"(HTTP {e.response.status_code}): "
+                                f"{e.response.text[:300]}"
                             )
                         except httpx.HTTPError as e:
                             st.error(f"❌ Transport error: {e}")
