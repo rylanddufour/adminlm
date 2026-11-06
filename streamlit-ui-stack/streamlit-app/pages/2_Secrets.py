@@ -1104,7 +1104,7 @@ else:
                                         f"❌ {type(e).__name__}: {e}"
                                     )
         with del_col:
-            with st.popover(f"🗑️ Delete {chosen_key}"):
+            with st.popover(f"🗑️ Delete"):
                 st.warning(
                     f"⚠️ Will **soft-delete** `{chosen_key}` at "
                     f"`{chosen_path}`. The secret is hidden but "
