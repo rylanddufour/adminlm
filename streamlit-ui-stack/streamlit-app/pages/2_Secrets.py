@@ -849,295 +849,295 @@ with add_col:
                         except Exception as e:
                             st.error(f"❌ {type(e).__name__}: {e}")
 
-    # Apply the search filter to the already-fetched secrets_rows
-    # (list was fetched at the top of this section, before the Add
-    # popover). Substring match on key OR description; empty query = all.
-    needle = search_query.strip().lower()
+# Apply the search filter to the already-fetched secrets_rows
+# (list was fetched at the top of this section, before the Add
+# popover). Substring match on key OR description; empty query = all.
+needle = search_query.strip().lower()
+if needle:
+    secrets_rows = [
+        r for r in secrets_rows
+        if isinstance(r, dict) and (
+            needle in r.get("secretKey", "").lower()
+            or needle in (r.get("secretComment") or "").lower()
+        )
+    ]
+
+if not list_error and not secrets_rows:
     if needle:
-        secrets_rows = [
-            r for r in secrets_rows
-            if isinstance(r, dict) and (
-                needle in r.get("secretKey", "").lower()
-                or needle in (r.get("secretComment") or "").lower()
-            )
-        ]
-
-    if not list_error and not secrets_rows:
-        if needle:
-            st.caption(
-                f"No secrets under `{browse_path}` match `{search_query}`. "
-                "Try a different search term."
-            )
-        else:
-            st.caption(
-                f"No secrets at `{browse_path}`. "
-                "Use the Add Secret button above to create one."
-            )
-    elif list_error:
-        pass  # list error already surfaced above; don't show the empty-state caption
-    else:
-        # Build a stable, sorted display — alphabetical by Key.
-        # The Description column (secretComment) is the operator-facing
-        # context; the Key is what the agent references; Updated is
-        # the v4 last-modified timestamp (ISO-8601).
-        #
-        # v1.0 is FLAT under path_prefix so we don't render a Path
-        # column (it's always the same). The view-pane re-uses
-        # `path_prefix` for the read call.
-        display_rows = sorted(
-            [
-                {
-                    "Description": r.get("secretComment") or "_(no description)_",
-                    "Key": r.get("secretKey", ""),
-                    "Updated": r.get("updatedAt", ""),
-                }
-                for r in secrets_rows
-                if isinstance(r, dict)
-            ],
-            key=lambda r: r["Key"],
-        )
-
-        # Streamlit >=1.30 supports on_select="rerun" + selection_mode="single-row"
-        # for click-to-select rows. The page spec requires >=1.39, so this works.
-        # We render as a read-only dataframe and read the selected row below.
         st.caption(
-            "Click a row to reveal its value below. Reveals are "
-            "audit-logged to Loki (no value is logged — only metadata)."
+            f"No secrets under `{browse_path}` match `{search_query}`. "
+            "Try a different search term."
         )
-        selection = st.dataframe(
-            display_rows,
-            use_container_width=True,
-            hide_index=True,
-            on_select="rerun",
-            selection_mode="single-row",
-            key="secrets_table",
+    else:
+        st.caption(
+            f"No secrets at `{browse_path}`. "
+            "Use the Add Secret button above to create one."
+        )
+elif list_error:
+    pass  # list error already surfaced above; don't show the empty-state caption
+else:
+    # Build a stable, sorted display — alphabetical by Key.
+    # The Description column (secretComment) is the operator-facing
+    # context; the Key is what the agent references; Updated is
+    # the v4 last-modified timestamp (ISO-8601).
+    #
+    # v1.0 is FLAT under path_prefix so we don't render a Path
+    # column (it's always the same). The view-pane re-uses
+    # `path_prefix` for the read call.
+    display_rows = sorted(
+        [
+            {
+                "Description": r.get("secretComment") or "_(no description)_",
+                "Key": r.get("secretKey", ""),
+                "Updated": r.get("updatedAt", ""),
+            }
+            for r in secrets_rows
+            if isinstance(r, dict)
+        ],
+        key=lambda r: r["Key"],
+    )
+
+    # Streamlit >=1.30 supports on_select="rerun" + selection_mode="single-row"
+    # for click-to-select rows. The page spec requires >=1.39, so this works.
+    # We render as a read-only dataframe and read the selected row below.
+    st.caption(
+        "Click a row to reveal its value below. Reveals are "
+        "audit-logged to Loki (no value is logged — only metadata)."
+    )
+    selection = st.dataframe(
+        display_rows,
+        use_container_width=True,
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        key="secrets_table",
+    )
+
+    # ------------------------------------------------------------------
+    # View pane — click row → reveal with st.toggle
+    # ------------------------------------------------------------------
+    section_header("View pane")
+
+    selected_idx: list[int] = []
+    try:
+        selected_idx = (
+            selection.selection.rows
+            if selection and selection.selection else []
+        )
+    except AttributeError:
+        # Pre-1.30 streamlit returns no `selection` attr; we fall back to
+        # a selectbox in that case so the page still works.
+        selected_idx = []
+
+    reveal = False
+    chosen: dict | None = None
+    chosen_key: str = ""
+    chosen_path: str = path_prefix.rstrip("/")
+    # Hoisted to outer scope so the Edit button (below) can pre-fill
+    # the value field when reveal is on. Empty string when reveal
+    # is off (operator must type the new value to save).
+    chosen_value: str = ""
+
+    if selected_idx:
+        chosen = display_rows[selected_idx[0]]
+        chosen_key = chosen["Key"]
+        # v1.0 path is the operator's path_prefix; v1.0 secrets are flat.
+        # Audit the view BEFORE showing the value so the event timestamp
+        # reflects the reveal moment, not the table render.
+        _audit_view(chosen_key, chosen_path)
+        reveal = st.toggle(
+            "Reveal value",
+            value=False,
+            key=f"reveal_{chosen_path}_{chosen_key}",
+            help="On = show the secret value (will be audit-logged). "
+                 "Off = mask with ••••.",
+        )
+    else:
+        st.caption(
+            "👆 Select a row above to view its secret. The reveal toggle "
+            "is auditable; every reveal is logged to Loki."
         )
 
-        # ------------------------------------------------------------------
-        # View pane — click row → reveal with st.toggle
-        # ------------------------------------------------------------------
-        section_header("View pane")
-
-        selected_idx: list[int] = []
+    if chosen and reveal:
+        # Fetch the single secret with its value. Catch errors so a
+        # 404 or 403 doesn't crash the whole page.
+        raw: dict = {}
+        value: str = ""
+        masked: str = "(empty)"
         try:
-            selected_idx = (
-                selection.selection.rows
-                if selection and selection.selection else []
+            raw = _read_secret(chosen_path, chosen_key)
+            value = raw.get("secretValue", "")
+            chosen_value = value  # hoisted so Edit button can pre-fill
+            masked = "•" * 12 if value else "(empty)"
+        except httpx.HTTPStatusError as e:
+            st.error(
+                f"❌ Cannot read `{chosen_key}` at "
+                f"`{chosen_path}`: HTTP {e.response.status_code}. "
+                "The list endpoint may have broader visibility than "
+                "the raw endpoint (scope-policy tightening, Phase 4)."
             )
-        except AttributeError:
-            # Pre-1.30 streamlit returns no `selection` attr; we fall back to
-            # a selectbox in that case so the page still works.
-            selected_idx = []
-
-        reveal = False
-        chosen: dict | None = None
-        chosen_key: str = ""
-        chosen_path: str = path_prefix.rstrip("/")
-        # Hoisted to outer scope so the Edit button (below) can pre-fill
-        # the value field when reveal is on. Empty string when reveal
-        # is off (operator must type the new value to save).
-        chosen_value: str = ""
-
-        if selected_idx:
-            chosen = display_rows[selected_idx[0]]
-            chosen_key = chosen["Key"]
-            # v1.0 path is the operator's path_prefix; v1.0 secrets are flat.
-            # Audit the view BEFORE showing the value so the event timestamp
-            # reflects the reveal moment, not the table render.
-            _audit_view(chosen_key, chosen_path)
-            reveal = st.toggle(
-                "Reveal value",
-                value=False,
-                key=f"reveal_{chosen_path}_{chosen_key}",
-                help="On = show the secret value (will be audit-logged). "
-                     "Off = mask with ••••.",
+            raw = {}
+        except httpx.HTTPError as e:
+            st.error(
+                f"❌ Cannot read `{chosen_key}`: "
+                f"transport error: {e}"
             )
-        else:
-            st.caption(
-                "👆 Select a row above to view its secret. The reveal toggle "
-                "is auditable; every reveal is logged to Loki."
+            raw = {}
+        except Exception as e:
+            st.error(
+                f"❌ Cannot read `{chosen_key}`: "
+                f"{type(e).__name__}: {e}"
             )
+            raw = {}
+        # Render whatever we got — if the try succeeded, `value`
+        # holds the real secret; if it failed, `value` is "" and
+        # we just show the masked hint.
+        chosen_desc = chosen.get("Description") or "_(no description)_"
+        st.markdown(
+            f"**Description:** {chosen_desc}  \n"
+            f"**Secret:** `{chosen_key}`  \n"
+            f"**Path:** `{chosen_path}`  \n"
+            f"**Value:** `{value or masked}`"
+        )
+        if raw.get("secretComment"):
+            st.caption(f"💬 Comment: {raw['secretComment']}")
+        if raw.get("updatedAt"):
+            st.caption(f"🕒 Updated: {raw['updatedAt']}")
+    elif chosen and not reveal:
+        chosen_desc = chosen.get("Description") or "_(no description)_"
+        st.markdown(
+            f"**Description:** {chosen_desc}  \n"
+            f"**Secret:** `{chosen_key}`  \n"
+            f"**Path:** `{chosen_path}`  \n"
+            f"**Value:** `••••••••••••` _(toggle above to reveal — "
+            "audit-logged)_"
+        )
 
-        if chosen and reveal:
-            # Fetch the single secret with its value. Catch errors so a
-            # 404 or 403 doesn't crash the whole page.
-            raw: dict = {}
-            value: str = ""
-            masked: str = "(empty)"
-            try:
-                raw = _read_secret(chosen_path, chosen_key)
-                value = raw.get("secretValue", "")
-                chosen_value = value  # hoisted so Edit button can pre-fill
-                masked = "•" * 12 if value else "(empty)"
-            except httpx.HTTPStatusError as e:
-                st.error(
-                    f"❌ Cannot read `{chosen_key}` at "
-                    f"`{chosen_path}`: HTTP {e.response.status_code}. "
-                    "The list endpoint may have broader visibility than "
-                    "the raw endpoint (scope-policy tightening, Phase 4)."
+    # ------------------------------------------------------------------
+    # Edit + Delete (Phase 6, BACKLOG #95) — show whenever a row
+    # is selected, regardless of reveal state. Mirrors the agent-
+    # tokens section's pattern (typed-confirmation per BACKLOG #25).
+    # ------------------------------------------------------------------
+    if chosen is not None:
+        edit_col, del_col = st.columns(2)
+        with edit_col:
+            with st.popover("✏️ Edit"):
+                if not _admin_token():
+                    st.error("❌ `INFISICAL_ADMIN_TOKEN` is empty — "
+                             "cannot edit secrets.")
+                else:
+                    with st.form(f"edit_{chosen_path}_{chosen_key}",
+                                 clear_on_submit=False):
+                        st.caption(
+                            f"Key: `{chosen_key}` _(cannot change)_  \n"
+                            f"Path: `{chosen_path}`"
+                        )
+                        edit_comment = st.text_input(
+                            "Description",
+                            value=chosen.get("Description") or "",
+                            key=f"edit_comment_{chosen_path}_{chosen_key}",
+                        )
+                        edit_value = st.text_area(
+                            "Value",
+                            value=chosen_value,
+                            key=f"edit_value_{chosen_path}_{chosen_key}",
+                            help=(
+                                "Pre-filled when value is revealed. "
+                                "Leave blank to keep current value."
+                                if chosen_value else
+                                "Reveal the value above first to "
+                                "pre-fill, or type the new value."
+                            ),
+                        )
+                        if st.form_submit_button("Save changes"):
+                            # If operator left value blank, PATCH only
+                            # the comment (keep current value).
+                            # Otherwise PATCH both value + comment.
+                            if not edit_value.strip():
+                                # Value blank → only update comment.
+                                try:
+                                    _update_secret(
+                                        chosen_path, chosen_key,
+                                        chosen_value or "",
+                                        comment=edit_comment.strip(),
+                                    )
+                                    _audit_secret("update", chosen_key,
+                                                   chosen_path)
+                                    st.success(
+                                        f"✅ Updated description for "
+                                        f"`{chosen_key}`."
+                                    )
+                                    st.rerun()
+                                except httpx.HTTPStatusError as e:
+                                    st.error(
+                                        f"❌ HTTP {e.response.status_code}: "
+                                        f"{e.response.text[:200]}"
+                                    )
+                                except httpx.HTTPError as e:
+                                    st.error(f"❌ Transport error: {e}")
+                                except Exception as e:
+                                    st.error(
+                                        f"❌ {type(e).__name__}: {e}"
+                                    )
+                            else:
+                                try:
+                                    _update_secret(
+                                        chosen_path, chosen_key,
+                                        edit_value,
+                                        comment=edit_comment.strip(),
+                                    )
+                                    _audit_secret("update", chosen_key,
+                                                   chosen_path)
+                                    st.success(
+                                        f"✅ Updated `{chosen_key}`."
+                                    )
+                                    st.rerun()
+                                except httpx.HTTPStatusError as e:
+                                    st.error(
+                                        f"❌ HTTP {e.response.status_code}: "
+                                        f"{e.response.text[:200]}"
+                                    )
+                                except httpx.HTTPError as e:
+                                    st.error(f"❌ Transport error: {e}")
+                                except Exception as e:
+                                    st.error(
+                                        f"❌ {type(e).__name__}: {e}"
+                                    )
+        with del_col:
+            with st.popover(f"🗑️ Delete {chosen_key}"):
+                st.warning(
+                    f"⚠️ Will **soft-delete** `{chosen_key}` at "
+                    f"`{chosen_path}`. The secret is hidden but "
+                    f"retained for audit. Type DELETE to confirm."
                 )
-                raw = {}
-            except httpx.HTTPError as e:
-                st.error(
-                    f"❌ Cannot read `{chosen_key}`: "
-                    f"transport error: {e}"
+                confirm_text = st.text_input(
+                    "Type DELETE to confirm",
+                    key=f"confirm_del_{chosen_path}_{chosen_key}",
                 )
-                raw = {}
-            except Exception as e:
-                st.error(
-                    f"❌ Cannot read `{chosen_key}`: "
-                    f"{type(e).__name__}: {e}"
-                )
-                raw = {}
-            # Render whatever we got — if the try succeeded, `value`
-            # holds the real secret; if it failed, `value` is "" and
-            # we just show the masked hint.
-            chosen_desc = chosen.get("Description") or "_(no description)_"
-            st.markdown(
-                f"**Description:** {chosen_desc}  \n"
-                f"**Secret:** `{chosen_key}`  \n"
-                f"**Path:** `{chosen_path}`  \n"
-                f"**Value:** `{value or masked}`"
-            )
-            if raw.get("secretComment"):
-                st.caption(f"💬 Comment: {raw['secretComment']}")
-            if raw.get("updatedAt"):
-                st.caption(f"🕒 Updated: {raw['updatedAt']}")
-        elif chosen and not reveal:
-            chosen_desc = chosen.get("Description") or "_(no description)_"
-            st.markdown(
-                f"**Description:** {chosen_desc}  \n"
-                f"**Secret:** `{chosen_key}`  \n"
-                f"**Path:** `{chosen_path}`  \n"
-                f"**Value:** `••••••••••••` _(toggle above to reveal — "
-                "audit-logged)_"
-            )
-
-        # ------------------------------------------------------------------
-        # Edit + Delete (Phase 6, BACKLOG #95) — show whenever a row
-        # is selected, regardless of reveal state. Mirrors the agent-
-        # tokens section's pattern (typed-confirmation per BACKLOG #25).
-        # ------------------------------------------------------------------
-        if chosen is not None:
-            edit_col, del_col = st.columns(2)
-            with edit_col:
-                with st.popover("✏️ Edit"):
-                    if not _admin_token():
-                        st.error("❌ `INFISICAL_ADMIN_TOKEN` is empty — "
-                                 "cannot edit secrets.")
+                if st.button(
+                    "Confirm delete",
+                    key=f"confirm_del_btn_{chosen_path}_{chosen_key}",
+                ):
+                    if confirm_text.strip() != "DELETE":
+                        st.error("❌ Confirmation text does not match.")
                     else:
-                        with st.form(f"edit_{chosen_path}_{chosen_key}",
-                                     clear_on_submit=False):
-                            st.caption(
-                                f"Key: `{chosen_key}` _(cannot change)_  \n"
-                                f"Path: `{chosen_path}`"
+                        try:
+                            _delete_secret(chosen_path, chosen_key)
+                            _audit_secret("delete", chosen_key,
+                                           chosen_path)
+                            st.success(f"✅ Deleted `{chosen_key}`.")
+                            st.rerun()
+                        except httpx.HTTPStatusError as e:
+                            st.error(
+                                f"❌ HTTP {e.response.status_code}: "
+                                f"{e.response.text[:200]}"
                             )
-                            edit_comment = st.text_input(
-                                "Description",
-                                value=chosen.get("Description") or "",
-                                key=f"edit_comment_{chosen_path}_{chosen_key}",
+                        except httpx.HTTPError as e:
+                            st.error(f"❌ Transport error: {e}")
+                        except Exception as e:
+                            st.error(
+                                f"❌ {type(e).__name__}: {e}"
                             )
-                            edit_value = st.text_area(
-                                "Value",
-                                value=chosen_value,
-                                key=f"edit_value_{chosen_path}_{chosen_key}",
-                                help=(
-                                    "Pre-filled when value is revealed. "
-                                    "Leave blank to keep current value."
-                                    if chosen_value else
-                                    "Reveal the value above first to "
-                                    "pre-fill, or type the new value."
-                                ),
-                            )
-                            if st.form_submit_button("Save changes"):
-                                # If operator left value blank, PATCH only
-                                # the comment (keep current value).
-                                # Otherwise PATCH both value + comment.
-                                if not edit_value.strip():
-                                    # Value blank → only update comment.
-                                    try:
-                                        _update_secret(
-                                            chosen_path, chosen_key,
-                                            chosen_value or "",
-                                            comment=edit_comment.strip(),
-                                        )
-                                        _audit_secret("update", chosen_key,
-                                                       chosen_path)
-                                        st.success(
-                                            f"✅ Updated description for "
-                                            f"`{chosen_key}`."
-                                        )
-                                        st.rerun()
-                                    except httpx.HTTPStatusError as e:
-                                        st.error(
-                                            f"❌ HTTP {e.response.status_code}: "
-                                            f"{e.response.text[:200]}"
-                                        )
-                                    except httpx.HTTPError as e:
-                                        st.error(f"❌ Transport error: {e}")
-                                    except Exception as e:
-                                        st.error(
-                                            f"❌ {type(e).__name__}: {e}"
-                                        )
-                                else:
-                                    try:
-                                        _update_secret(
-                                            chosen_path, chosen_key,
-                                            edit_value,
-                                            comment=edit_comment.strip(),
-                                        )
-                                        _audit_secret("update", chosen_key,
-                                                       chosen_path)
-                                        st.success(
-                                            f"✅ Updated `{chosen_key}`."
-                                        )
-                                        st.rerun()
-                                    except httpx.HTTPStatusError as e:
-                                        st.error(
-                                            f"❌ HTTP {e.response.status_code}: "
-                                            f"{e.response.text[:200]}"
-                                        )
-                                    except httpx.HTTPError as e:
-                                        st.error(f"❌ Transport error: {e}")
-                                    except Exception as e:
-                                        st.error(
-                                            f"❌ {type(e).__name__}: {e}"
-                                        )
-            with del_col:
-                with st.popover(f"🗑️ Delete {chosen_key}"):
-                    st.warning(
-                        f"⚠️ Will **soft-delete** `{chosen_key}` at "
-                        f"`{chosen_path}`. The secret is hidden but "
-                        f"retained for audit. Type DELETE to confirm."
-                    )
-                    confirm_text = st.text_input(
-                        "Type DELETE to confirm",
-                        key=f"confirm_del_{chosen_path}_{chosen_key}",
-                    )
-                    if st.button(
-                        "Confirm delete",
-                        key=f"confirm_del_btn_{chosen_path}_{chosen_key}",
-                    ):
-                        if confirm_text.strip() != "DELETE":
-                            st.error("❌ Confirmation text does not match.")
-                        else:
-                            try:
-                                _delete_secret(chosen_path, chosen_key)
-                                _audit_secret("delete", chosen_key,
-                                               chosen_path)
-                                st.success(f"✅ Deleted `{chosen_key}`.")
-                                st.rerun()
-                            except httpx.HTTPStatusError as e:
-                                st.error(
-                                    f"❌ HTTP {e.response.status_code}: "
-                                    f"{e.response.text[:200]}"
-                                )
-                            except httpx.HTTPError as e:
-                                st.error(f"❌ Transport error: {e}")
-                            except Exception as e:
-                                st.error(
-                                    f"❌ {type(e).__name__}: {e}"
-                                )
 
 
 # ============================================================================
