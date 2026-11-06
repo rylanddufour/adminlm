@@ -1028,7 +1028,10 @@ else:
         # the buttons snug to the left.
         edit_col, del_col = st.columns([1, 4])
         with edit_col:
-            with st.popover("✏️ Edit", use_container_width=False):
+            with st.popover(
+                f"✏️ Edit {chosen_key}",
+                use_container_width=False,
+            ):
                 if not _admin_token():
                     st.error("❌ `INFISICAL_ADMIN_TOKEN` is empty — "
                              "cannot edit secrets.")
