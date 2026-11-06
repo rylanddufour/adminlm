@@ -731,12 +731,38 @@ section_header("Customer secrets")
 # v1.0 keeps secrets FLAT under path_prefix — no system subfolder logic.
 browse_path = path_prefix.rstrip("/")
 
+# Fetch the secret list FIRST so the Add Secret popover below can do a
+# live collision check on every keystroke. The list is also used by
+# the table renderer further down — same data, one fetch.
+secrets_rows: list[dict] = []
+list_error: str | None = None
+try:
+    secrets_rows = _list_secrets(browse_path)
+except httpx.HTTPStatusError as e:
+    list_error = f"HTTP {e.response.status_code}: {e}"
+except httpx.HTTPError as e:
+    list_error = f"transport error: {type(e).__name__}: {e}"
+except Exception as e:
+    list_error = f"{type(e).__name__}: {e}"
+
+if list_error:
+    # If the list call failed, still let the operator try to add secrets
+    # (the Add Secret form has its own error handling). But surface the
+    # list failure prominently — the table below will also show it.
+    st.error(
+        f"❌ **Cannot list secrets** at `{browse_path}`: {list_error}. "
+        f"Upstream: `{_infisical_url()}`. Check the Settings page "
+        "(Infisical URL) and the operator token."
+    )
+
 # ---------------------------------------------------------------------------
 # Add Secret — popover with inline form (Phase 6, BACKLOG #95)
 # ---------------------------------------------------------------------------
 # Uses INFISICAL_ADMIN_TOKEN (mirrors the agent-tokens section below).
 # Path is fixed to path_prefix (v1.0 is flat); operator can override via the
 # Advanced expander hidden earlier in the page. Form clears on submit.
+# The live collision check inside the form reads secrets_rows from the
+# list query above — that's why the list runs first.
 add_col, _ = st.columns([1, 6])
 with add_col:
     with st.popover("➕ Add Secret", use_container_width=False):
@@ -747,12 +773,39 @@ with add_col:
         else:
             with st.form("add_secret_form", clear_on_submit=True):
                 st.caption(f"Path: `{browse_path}` (v1.0 is FLAT)")
+                # `key=` so we can read the typed value from session_state
+                # for the live collision check below. The form reruns on
+                # every keystroke so the warning updates as the operator
+                # types.
                 new_key = st.text_input(
                     "Key",
                     placeholder="e.g. STRIPE_API_KEY",
                     help="Uppercase with underscores. Used by the agent. "
-                         "Must be unique under the path.",
+                         "Must be unique under the path. Use system-prefix "
+                         "style for clarity (e.g. WINDOWS_ADMIN_USER).",
+                    key="add_key_input",
                 )
+                # Live collision check — runs on every keystroke. The form
+                # rerender gives us session_state["add_key_input"] even
+                # though `new_key` (the local var) isn't bound until submit.
+                _typed_key = st.session_state.get("add_key_input", "").strip()
+                if _typed_key:
+                    _existing_keys = {
+                        r.get("secretKey", "")
+                        for r in secrets_rows
+                        if isinstance(r, dict)
+                    }
+                    if _typed_key in _existing_keys:
+                        st.warning(
+                            f"⚠️ Key `{_typed_key}` already exists at "
+                            f"`{browse_path}`. Pick a different name, "
+                            "or use the Edit button below to update "
+                            "the existing secret."
+                        )
+                    else:
+                        st.caption(
+                            f"✅ Key `{_typed_key}` is available."
+                        )
                 new_comment = st.text_input(
                     "Description",
                     placeholder="e.g. Stripe API key for billing",
@@ -796,27 +849,9 @@ with add_col:
                         except Exception as e:
                             st.error(f"❌ {type(e).__name__}: {e}")
 
-secrets_rows: list[dict] = []
-list_error: str | None = None
-try:
-    secrets_rows = _list_secrets(browse_path)
-except httpx.HTTPStatusError as e:
-    list_error = f"HTTP {e.response.status_code}: {e}"
-except httpx.HTTPError as e:
-    list_error = f"transport error: {type(e).__name__}: {e}"
-except Exception as e:
-    list_error = f"{type(e).__name__}: {e}"
-
-if list_error:
-    st.error(
-        f"❌ **Cannot list secrets** at `{browse_path}`: {list_error}. "
-        f"Upstream: `{_infisical_url()}`. Check the Settings page "
-        "(Infisical URL) and the operator token."
-    )
-else:
-    # Apply the search filter AFTER the list call so we get full
-    # metadata (including secretComment) for the in-memory filter.
-    # Substring match on key OR description; empty query = show all.
+    # Apply the search filter to the already-fetched secrets_rows
+    # (list was fetched at the top of this section, before the Add
+    # popover). Substring match on key OR description; empty query = all.
     needle = search_query.strip().lower()
     if needle:
         secrets_rows = [
@@ -827,7 +862,7 @@ else:
             )
         ]
 
-    if not secrets_rows:
+    if not list_error and not secrets_rows:
         if needle:
             st.caption(
                 f"No secrets under `{browse_path}` match `{search_query}`. "
@@ -836,8 +871,10 @@ else:
         else:
             st.caption(
                 f"No secrets at `{browse_path}`. "
-                "Phase 6 (operator CRUD) will populate this."
+                "Use the Add Secret button above to create one."
             )
+    elif list_error:
+        pass  # list error already surfaced above; don't show the empty-state caption
     else:
         # Build a stable, sorted display — alphabetical by Key.
         # The Description column (secretComment) is the operator-facing
