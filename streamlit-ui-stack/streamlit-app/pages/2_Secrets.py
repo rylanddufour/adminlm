@@ -471,6 +471,15 @@ def _audit_secret(action: str, secret_key: str, secret_path: str) -> None:
 # for this). Documented as a known limitation in the header comment.
 AGENT_ROLE = "viewer"
 
+# Canonical name for the single agent identity that infisical-mcp uses.
+# Must match the name bootstrap.sh:provision_infisical_agent_identity()
+# generates, otherwise bootstrap's lookup-by-name would re-create a
+# second identity on the next upgrade. v1.0 keeps a single canonical
+# agent identity (no per-purpose identities like 'ad-only' or
+# 'ssh-default') — folder-scoped access comes from the Infisical role
+# grant, not from per-purpose identities (BACKLOG #94 Phase 4 limitation).
+AGENT_TOKEN_NAME = "agent-default"
+
 
 def _list_machine_identities() -> list[dict]:
     """Return all machine identities in the project (incl. the operator's).
@@ -1223,57 +1232,102 @@ else:
         st.dataframe(display_rows, use_container_width=True, hide_index=True)
 
 
-# Create form
-with st.form("agent_token_create_form"):
-    st.markdown("**Create new agent token**")
-    new_name = st.text_input(
-        "Name",
-        key="new_agent_token_name",
-        help=(
-            "Identifier for this agent token (e.g. 'ad-only', 'ssh-default'). "
-            "Must be unique within the project."
-        ),
+# ---------------------------------------------------------------------
+# Create flow (Phase 4, operator decision 2026-11-05)
+# ---------------------------------------------------------------------
+# v1.0 keeps a single canonical agent identity (name = "agent-default")
+# — the same name bootstrap.sh:provision_infisical_agent_identity()
+# uses. The operator does NOT pick a name; the page picks it for them
+# so the bootstrap lookup-by-name and the runtime identity always
+# match. If the canonical identity already exists, the page refuses
+# to create a second one and tells the operator to Revoke first (then
+# come back to this section to recreate).
+#
+# The create button performs the same 4-step flow bootstrap does
+# (create identity → attach UA → mint client-secret → exchange for
+# JWT → grant viewer role). The resulting JWT is shown once in
+# st.code() for the operator to copy. Today the operator still has
+# to manually SSH to update ~/.hermes/secrets/infisical-agent.env
+# and restart infisical-mcp — BACKLOG #98 tracks automating that
+# last step. Until #98 ships, the warning below calls out the manual
+# steps explicitly.
+# ---------------------------------------------------------------------
+agent_default_exists = any(
+    mi.get("name") == AGENT_TOKEN_NAME for mi in agent_rows
+)
+create_submitted: bool = False
+if agent_default_exists:
+    st.warning(
+        f"⚠️ An `{AGENT_TOKEN_NAME}` token already exists. "
+        f"To rotate it in place, use the **Rotate** button in the "
+        f"list above. To replace it entirely, click **Revoke** above "
+        f"first, then refresh this page — the Create button will "
+        f"reappear."
     )
+else:
     st.caption(
-        f"Role: `{AGENT_ROLE}` (read-only, project-wide). v1.0 limitation; "
-        "v1.x will add folder scoping."
+        f"No `{AGENT_TOKEN_NAME}` token exists yet. Click below to "
+        f"create it with role `{AGENT_ROLE}` (read-only, "
+        f"project-wide — the same convention bootstrap uses)."
     )
-    create_submitted = st.form_submit_button("Create agent token")
+    with st.form("agent_token_create_form"):
+        create_submitted = st.form_submit_button(
+            f"Create {AGENT_TOKEN_NAME} token"
+        )
 
 if create_submitted:
-    if not new_name.strip():
-        st.error("❌ Name is required.")
-    elif not _admin_token():
+    if not _admin_token():
         st.error(
             "❌ `INFISICAL_ADMIN_TOKEN` is empty in this container. "
-            "Re-run `bootstrap.sh deploy_infisical_stack()` to regenerate "
-            "the operator env file, then restart streamlit-ui: "
+            "Re-run `bootstrap.sh deploy_infisical_stack()` to "
+            "regenerate the operator env file, then restart streamlit-ui: "
             "`docker compose -f docker-compose.yml up -d streamlit-ui`."
         )
     else:
         try:
             mi_id = _create_machine_identity(
-                name=new_name.strip(),
+                name=AGENT_TOKEN_NAME,
                 description=(
-                    f"Agent token for IT_ADMIN agent (BACKLOG #94 Phase 4). "
-                    f"Created by operator {st.session_state.get('user', 'unknown')}."
+                    f"Agent token for IT_ADMIN agent "
+                    f"(BACKLOG #94 Phase 4). Created by operator "
+                    f"{st.session_state.get('user', 'unknown')} via "
+                    f"Streamlit Secrets page."
                 ),
             )
             if not mi_id:
-                raise RuntimeError("create_machine_identity returned empty id")
+                raise RuntimeError(
+                    "create_machine_identity returned empty id"
+                )
             client_id, client_secret = _add_universal_auth(mi_id)
             if not client_id or not client_secret:
-                raise RuntimeError("add_universal_auth returned empty credentials")
-            access_token = _exchange_for_token(mi_id, client_id, client_secret)
+                raise RuntimeError(
+                    "add_universal_auth returned empty credentials"
+                )
+            access_token = _exchange_for_token(
+                mi_id, client_id, client_secret
+            )
             if not access_token:
-                raise RuntimeError("exchange_for_token returned empty token")
+                raise RuntimeError(
+                    "exchange_for_token returned empty token"
+                )
             role_granted = _grant_role(mi_id, AGENT_ROLE)
-            _audit_token("create", mi_id, new_name.strip())
-            st.success(f"✅ Agent token created: {new_name}")
+            _audit_token("create", mi_id, AGENT_TOKEN_NAME)
+            st.success(
+                f"✅ Agent token created: `{AGENT_TOKEN_NAME}`"
+            )
             st.warning(
-                "⚠️ **Copy this token now.** It will not be shown again. "
-                "Paste it into the agent's MCP config (Phase 5) or your "
-                "password manager."
+                "⚠️ **Copy this JWT now — it is shown ONCE.** "
+                "Until BACKLOG #98 ships, the operator still has to "
+                "wire it into `infisical-mcp` manually: "
+                "(1) Copy the JWT from the code block below. "
+                "(2) SSH to the AdminLM host as the operator user. "
+                "(3) Edit `~/.hermes/secrets/infisical-agent.env` — "
+                "replace `INFISICAL_AGENT_TOKEN=...` with the new JWT. "
+                "(4) Restart the container: "
+                "`docker compose -f ~/adminlm/infisical-mcp/"
+                "docker-compose.yml up -d infisical-mcp`. "
+                "Until step (4), the agent's get_secret calls return "
+                "401 from Infisical."
             )
             st.code(access_token, language=None)
             if not role_granted:
