@@ -1019,9 +1019,16 @@ else:
     # tokens section's pattern (typed-confirmation per BACKLOG #25).
     # ------------------------------------------------------------------
     if chosen is not None:
-        edit_col, del_col = st.columns(2)
+        # Edit + Delete side by side, ADJACENT (not at opposite ends).
+        # Use [1, 4] instead of [1, 1] so the Delete button has room for
+        # its full label "🗑️ Delete {key}" — otherwise it stretches
+        # to its column width and the key name gets clipped. Also
+        # use use_container_width=False on each popover so they
+        # shrink to their label width (not column width), keeping
+        # the buttons snug to the left.
+        edit_col, del_col = st.columns([1, 4])
         with edit_col:
-            with st.popover("✏️ Edit"):
+            with st.popover("✏️ Edit", use_container_width=False):
                 if not _admin_token():
                     st.error("❌ `INFISICAL_ADMIN_TOKEN` is empty — "
                              "cannot edit secrets.")
@@ -1104,7 +1111,10 @@ else:
                                         f"❌ {type(e).__name__}: {e}"
                                     )
         with del_col:
-            with st.popover(f"🗑️ Delete"):
+            with st.popover(
+                f"🗑️ Delete {chosen_key}",
+                use_container_width=False,
+            ):
                 st.warning(
                     f"⚠️ Will **soft-delete** `{chosen_key}` at "
                     f"`{chosen_path}`. The secret is hidden but "
