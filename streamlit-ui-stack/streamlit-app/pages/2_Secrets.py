@@ -482,7 +482,19 @@ AGENT_TOKEN_NAME = "agent-default"
 
 
 def _list_machine_identities() -> list[dict]:
-    """Return all machine identities in the project (incl. the operator's).
+    """Return the canonical agent machine identity for this project.
+
+    v1.0 keeps exactly ONE agent identity (name = "agent-default",
+    AGENT_TOKEN_NAME) — the same one bootstrap.sh creates. The page
+    queries with `?search=` so the server does the filtering, which
+    keeps orphaned/garbage identities (e.g. from a failed Create that
+    died before attaching universal auth) out of the operator's list
+    entirely. Verified on .220 2026-11-06: `?search=agent-default`
+    returns exactly the one identity; without it, the list also
+    returns any junk identities left behind by earlier test runs.
+
+    v0.166.2: GET /api/v1/projects/{projectId}/identities?search=<name>
+    → {identities: [...], totalCount: N}
 
     Caller filters out the operator identity by name. Returns the raw API
     response list; we don't shape the data here so the caller can pick
@@ -492,8 +504,12 @@ def _list_machine_identities() -> list[dict]:
     # v0.166.2: GET /api/v1/projects/{projectId}/identities → {identities, totalCount}
     # Project-scoped (no orgId needed; lists identities created in this project
     # via POST /api/v1/projects/{projectId}/identities).
+    # `?search=` filters server-side to the canonical agent identity.
     pid = _project_id()
-    url = f"{base}/api/v1/projects/{pid}/identities"
+    url = (
+        f"{base}/api/v1/projects/{pid}/identities"
+        f"?search={AGENT_TOKEN_NAME}"
+    )
     # Read uses operator token — viewer role is sufficient for listing identities.
     headers = {"Authorization": f"Bearer {_operator_token()}"}
     resp = httpx.get(url, headers=headers, timeout=_API_TIMEOUT_S)
@@ -547,6 +563,12 @@ def _add_universal_auth(mi_id: str) -> tuple[str, str]:
     One-time per identity creation; rotate = call this again (replaces).
 
     v0.166.2 wiring:
+      - POST /api/v1/auth/universal-auth/identities/{id}
+        ATTACHES universal auth to the identity. MUST run before
+        minting a client secret — otherwise the client-secrets call
+        fails with 400 "The identity does not have universal auth"
+        (verified live on .220 2026-11-06). All body fields have
+        defaults, so an empty {} body works.
       - POST /api/v1/auth/universal-auth/identities/{id}/client-secrets
         returns {clientSecret, clientSecretData: {...}}. The clientSecret
         value goes straight into the login body.
@@ -559,6 +581,18 @@ def _add_universal_auth(mi_id: str) -> tuple[str, str]:
         .identityUAId are PKs of OTHER tables).
     """
     base = _infisical_url().rstrip("/")
+
+    # 0) ATTACH universal auth to the identity. Idempotent — if the
+    # identity already has UA (e.g. on Rotate of an existing token),
+    # the server returns the existing record rather than erroring.
+    attach_url = f"{base}/api/v1/auth/universal-auth/identities/{mi_id}"
+    attach_resp = httpx.post(
+        attach_url,
+        headers={**_admin_headers(), "Content-Type": "application/json"},
+        json={},
+        timeout=_API_TIMEOUT_S,
+    )
+    attach_resp.raise_for_status()
 
     # 1) Create the client secret. Capture the value (not the clientId).
     cs_url = f"{base}/api/v1/auth/universal-auth/identities/{mi_id}/client-secrets"
@@ -623,10 +657,20 @@ def _grant_role(mi_id: str, role: str = AGENT_ROLE) -> bool:
 
 
 def _revoke_machine_identity(mi_id: str) -> None:
-    """Delete the machine identity (cascades: credentials + role grants)."""
+    """Delete the machine identity (cascades: credentials + role grants).
+
+    v0.166.2: project-scoped identities (created via
+    POST /api/v1/projects/{projectId}/identities) MUST be deleted via
+    DELETE /api/v1/projects/{projectId}/identities/{identityId}.
+    The org-level DELETE /api/v1/identities/{identityId} rejects them
+    with 400 "Identity is managed by project" (verified live on .220
+    2026-11-06). Verified: project-scoped DELETE returns 200.
+    """
     base = _infisical_url().rstrip("/")
-    # v0.166.2: DELETE /api/v1/identities/{identityId}
-    url = f"{base}/api/v1/identities/{mi_id}"
+    url = (
+        f"{base}/api/v1/projects/{_project_id()}"
+        f"/identities/{mi_id}"
+    )
     resp = httpx.delete(url, headers=_admin_headers(), timeout=_API_TIMEOUT_S)
     # 404 on already-deleted is fine — operator-initiated revoke is
     # idempotent in spirit.
