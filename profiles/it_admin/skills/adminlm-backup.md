@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Documents the daily AdminLM stack backup workflow so the IT_ADMIN agent can run, verify, and troubleshoot it. Captures everything needed to restore the AdminLM stack to a working state without depending on git or upstream services — per the BACKLOG #6 "Backup script" work, **the customer can never push changes to the adminlm repo**, so the backup must be self-contained.
+Documents the daily AdminLM stack backup workflow so the IT_ADMIN agent can run, verify, and troubleshoot it. Captures everything needed to restore the AdminLM stack to a working state without depending on git or upstream services — **the customer can never push changes to the adminlm repo**, so the backup must be self-contained.
 
 ## When to use
 
@@ -31,7 +31,7 @@ Documents the daily AdminLM stack backup workflow so the IT_ADMIN agent can run,
 | `MANIFEST.json` | Generated at the end | Counts + sizes for verification |
 
 **Excluded intentionally:**
-- Loki chunks + Prometheus TSDB — backed up by their own retention / compactor mechanisms (BACKLOG #5 covers Loki; Prometheus snapshot API for metrics)
+- Loki chunks + Prometheus TSDB — backed up by their own retention / compactor mechanisms (Loki has its own retention; Prometheus has a snapshot API for metrics)
 - `hermes-agent` code — installable from PyPI; not customer state
 - Docker volumes for grafana-data / loki / prometheus — service-level, not file-level
 - `/var/log/hermes-bootstrap-credentials.log` — same VM as the script; if you lose that you have bigger problems. Add explicitly if you want it backed up.
@@ -192,7 +192,7 @@ The manifest is the quickest way to verify a backup:
 
 ## What this backup does NOT cover
 
-- **Same-VM only.** The script writes to `~/backups/` on the same host. If the VM dies completely, the backup dies with it. This is BACKLOG #6's known follow-up: ship an off-host (rclone / restic / NAS) target. Tracked separately; not in scope of this script.
+- **Same-VM only.** The script writes to `~/backups/` on the same host. If the VM dies completely, the backup dies with it. Shipping an off-host (rclone / restic / NAS) target is a known follow-up; it is tracked separately and is not in scope of this script.
 - **Encryption at rest.** The hermes zip contains API keys in plain text, and the Infisical section contains the `ENCRYPTION_KEY` in clear text. The tarball is readable by anyone with file access on the host — and with it, every customer IT secret. If the host itself is compromised, the backup is too. v1.0 relies on the off-host target's own encryption (rclone-crypt / restic / encrypted NAS). Treat the tarball as a secret. v2.x adds an opt-in second layer via `/adminlm/backup-encryption/KEY`.
 - **Loki logs / Prometheus metrics.** Per `excluded intentionally` above — those have their own retention mechanisms.
 - **The hermes-agent code itself.** Reinstall from PyPI for the same version. Pin via the `hermes-agent==X.Y.Z` in the bootstrap requirements.
@@ -212,4 +212,4 @@ The manifest is the quickest way to verify a backup:
 - Cron registration: `install_dashboard_backup_hermes_cron()` in `bootstrap.sh` (replaces the legacy `/etc/cron.d/adminlm-dashboard-backup` system cron)
 - Gateway (cron scheduler daemon): `install_hermes_gateway_service()` in `bootstrap.sh` — installs the system-level systemd service that ticks the cron
 - Legacy system cron: `/etc/cron.d/adminlm-dashboard-backup` — removed by the new install on re-bootstrap
-- BACKLOG #6 (parent): "Backup script | Export config files and dashboards for disaster recovery" — **RESOLVED by this skill + script**
+- The backup script is the source of truth for what lands in the archive; this skill documents it

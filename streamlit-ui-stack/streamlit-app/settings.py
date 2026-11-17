@@ -62,8 +62,10 @@ class Settings:
           return 404/302 but `_check_one` treats any HTTP response as reachable)
         - /-/ready (Prometheus 2.x; returns 200 when ready to serve)
         - /api/health (Grafana; returns 200 with build info)
+        - /api/status (the customer secret vault; returns 200 once the
+          vault has completed its first-boot setup)
 
-        BACKLOG #68 — added Prometheus + Grafana (previously missing).
+        Prometheus and Grafana declare their own readiness endpoints.
         """
         return [
             ("Hermes Dashboard", self.hermes_url, "/health"),
@@ -73,6 +75,7 @@ class Settings:
             ("Prometheus", self.prometheus_url, "/-/ready"),
             ("Grafana", self.grafana_url, "/api/health"),
             ("Ansible Runner", self.ansible_runner_url, "/health"),
+            ("Infisical", self.infisical_url, "/api/status"),
         ]
 
     @property
@@ -215,14 +218,14 @@ EDITABLE_FIELDS: list[dict] = [
     {
         "key": "INFISICAL_URL",
         "group": "Backend URLs",
-        "label": "Infisical (BACKLOG #94)",
+        "label": "Infisical (Secret Store)",
         "default": "http://infisical:8090",
-        "help": "Internal URL for the Infisical API (used by the Secrets "
-                "page, BACKLOG #94 Phase 3). Container-internal; reachable "
-                "because streamlit-ui is attached to the `infisical` Docker "
-                "network. Phase 3 read-only MVP — the operator token grants "
-                "Viewer role, so /api/v3/secrets/raw returns the listed "
-                "secrets and nothing else.",
+        "help": "Internal URL for the customer secret store, used by the "
+                "Secrets page. Container-internal; reachable because "
+                "streamlit-ui is attached to the `infisical` Docker network. "
+                "Listing and viewing use a read-only operator token; "
+                "creating, editing and deleting escalate to the admin token "
+                "automatically, so you never handle it directly.",
     },
     # --- Quick Links (browser-facing, host IP) ---
     {
