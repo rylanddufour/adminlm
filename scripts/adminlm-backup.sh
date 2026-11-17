@@ -13,6 +13,8 @@
 #   5. KB MCP SQLite database (same pattern)
 #   6. Grafana-stack yml configs (alloy, blackbox, loki, prometheus, promtail,
 #      datasources, dashboards.yml provisioning config)
+#   7. Infisical customer-IT secret store — Postgres logical dump PLUS the
+#      ENCRYPTION_KEY material needed to decrypt it (a dump alone is useless)
 #
 # Excluded intentionally:
 #   - Loki chunks + Prometheus TSDB — backed up by their own retention
@@ -47,11 +49,20 @@ mkdir -p "$BACKUP_DIR" \
          "$WORK/dashboards-provisioned" \
          "$WORK/config" \
          "$WORK/db" \
-         "$WORK/hermes"
+         "$WORK/hermes" \
+         "$WORK/infisical"
 trap 'rm -rf "$WORK"' EXIT
 
 log() { echo "[$(date -Is)] $*"; }
 fail() { log "ERROR: $*"; exit 1; }
+
+# Read one key from an env-style file (no shell sourcing — the Infisical .env
+# defines DB_CONNECTION_URI / REDIS_URL / SMTP_* and sourcing it under
+# `set -u` is fragile). Strips optional surrounding quotes.
+envval() {
+    grep -m1 "^$1=" "$2" 2>/dev/null | cut -d= -f2- \
+        | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'\$//" | tr -d '\r'
+}
 
 # ===== Load Grafana service account token (shared with the agent profiles) =====
 [ -r "$TOKEN_FILE" ] || fail "token file not readable: $TOKEN_FILE (create_grafana_mcp_service_account creates it)"
@@ -190,18 +201,152 @@ for f in grafana/provisioning/datasources/datasources.yml \
     fi
 done
 
-# ===== 7. Manifest =====
+
+# ===== 7. Infisical — customer IT secret store =====
+# Infisical encrypts every secret value at rest using ENCRYPTION_KEY from
+# infisical-stack/.env. A Postgres dump on its own is therefore unreadable —
+# the backup MUST capture the encryption material alongside the dump, or the
+# customer loses their secrets on restore.
+#
+# v1.0 ships this PLAIN. Operator decision 2026-10-06: the off-host backup
+# target's own encryption-at-rest is the operator's responsibility
+# (rclone-crypt / restic / NAS-level). v2.x adds an opt-in
+# /adminlm/backup-encryption/KEY path.
+INFISICAL_STACK_DIR="${INFISICAL_STACK_DIR:-$ADMINLM_DIR/infisical-stack}"
+INFISICAL_ENV_FILE="${INFISICAL_ENV_FILE:-$INFISICAL_STACK_DIR/.env}"
+# Error logs live OUTSIDE the archive. pg_dump failures can echo the
+# connection URI (and therefore the DB password) into stderr — that must not
+# travel inside a tarball the operator copies to an off-host target.
+INFISICAL_ERRLOG="$BACKUP_DIR/adminlm-backup-errors/${TS}-infisical.err"
+mkdir -p "$(dirname "$INFISICAL_ERRLOG")"
+INFISICAL_DB_SIZE=0
+INFISICAL_ENV_PRESENT=0
+INFISICAL_SECRET_COUNT=0
+INFISICAL_REDIS_SIZE=0
+
+mkdir -p "$WORK/infisical"
+
+if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx 'infisical-postgres'; then
+    log "Dumping Infisical Postgres (customer IT secret store)"
+
+    PG_USER="$(envval POSTGRES_USER "$INFISICAL_ENV_FILE")"
+    PG_DB="$(envval POSTGRES_DB "$INFISICAL_ENV_FILE")"
+    # Fall back to the container's own view of the environment.
+    [ -n "$PG_USER" ] || PG_USER="$(docker exec infisical-postgres printenv POSTGRES_USER 2>/dev/null | tr -d '\r\n')"
+    [ -n "$PG_DB" ]   || PG_DB="$(docker exec infisical-postgres printenv POSTGRES_DB 2>/dev/null | tr -d '\r\n')"
+
+    if [ -z "$PG_USER" ] || [ -z "$PG_DB" ]; then
+        log "  WARN: could not determine POSTGRES_USER/POSTGRES_DB — skipping Infisical dump"
+    else
+        # --clean --if-exists makes the dump re-runnable into an existing DB.
+        if docker exec infisical-postgres \
+             pg_dump -U "$PG_USER" -d "$PG_DB" --clean --if-exists --no-owner --no-privileges \
+             2>>"$INFISICAL_ERRLOG" | gzip -9 > "$WORK/infisical/infisical-db.sql.gz"; then
+            INFISICAL_DB_SIZE=$(stat -c%s "$WORK/infisical/infisical-db.sql.gz" 2>/dev/null || echo 0)
+            log "  Infisical Postgres dump: $INFISICAL_DB_SIZE bytes"
+            # Integrity + header check. A truncated archive that "succeeded"
+            # is the worst failure mode — catch it here.
+            if python3 -c '
+import gzip, sys
+try:
+    with gzip.open(sys.argv[1], "rt", errors="replace") as fh:
+        head = fh.read(4096)
+except Exception:
+    sys.exit(1)
+sys.exit(0 if "PostgreSQL database dump" in head else 2)
+' "$WORK/infisical/infisical-db.sql.gz"; then
+                log "  dump verified (gzip intact, schema header present)"
+            else
+                log "  WARN: dump failed integrity/header check — the archive may be truncated"
+            fi
+        else
+            log "  WARN: pg_dump failed (see $INFISICAL_ERRLOG); Infisical NOT captured"
+            rm -f "$WORK/infisical/infisical-db.sql.gz"
+        fi
+    fi
+
+    # Secret count for the manifest. v0.166.x stores secrets in
+    # public.secrets_v2; older releases use public.secrets. Probe both.
+    if [ -n "$PG_USER" ] && [ -n "$PG_DB" ]; then
+        for T in public.secrets_v2 public.secrets; do
+            C=$(docker exec infisical-postgres psql -U "$PG_USER" -d "$PG_DB" -tAc \
+                  "select count(*) from $T;" 2>/dev/null | tr -d '[:space:]' || true)
+            if [ -n "$C" ] && [ "$C" != "0" ]; then
+                INFISICAL_SECRET_COUNT="$C"
+                break
+            fi
+        done
+    fi
+    log "  Infisical secret count: $INFISICAL_SECRET_COUNT"
+
+    # The count above came from the LIVE database. Confirm the dump actually
+    # carries those rows — a dump that is missing the secrets table would
+    # still produce a valid-looking archive. pg_dump emits COPY blocks, so
+    # count the data lines inside the secrets COPY block.
+    if [ "$INFISICAL_DB_SIZE" -gt 0 ]; then
+        DUMP_COUNT=$(zcat "$WORK/infisical/infisical-db.sql.gz" 2>/dev/null | awk '
+            /^COPY public\.secrets_v2 / { inblk=1; next }
+            /^COPY / { inblk=0 }
+            inblk && /^\\\.$/ { inblk=0; next }
+            inblk { c++ }
+            END { print c+0 }
+        ' || echo 0)
+        if [ "$DUMP_COUNT" = "$INFISICAL_SECRET_COUNT" ]; then
+            log "  dump row count matches the live database ($DUMP_COUNT)"
+        else
+            log "  WARN: dump contains $DUMP_COUNT secret row(s) but the live database has $INFISICAL_SECRET_COUNT — the archive may not restore every secret"
+        fi
+    fi
+
+    # Redis holds cache + BullMQ queues. Captured for completeness; the
+    # restore script does NOT replay it by default (a stale cache pointing at
+    # deleted identities is worse than the empty cache Infisical rebuilds).
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx 'infisical-redis'; then
+        REDIS_PW="$(envval REDIS_PASSWORD "$INFISICAL_ENV_FILE")"
+        if docker exec -e REDISCLI_AUTH="$REDIS_PW" infisical-redis redis-cli SAVE >/dev/null 2>&1 \
+           && docker cp infisical-redis:/data/dump.rdb "$WORK/infisical/redis-dump.rdb" 2>>"$INFISICAL_ERRLOG"; then
+            INFISICAL_REDIS_SIZE=$(stat -c%s "$WORK/infisical/redis-dump.rdb" 2>/dev/null || echo 0)
+            log "  Infisical Redis RDB: $INFISICAL_REDIS_SIZE bytes (captured, not auto-restored)"
+        else
+            log "  WARN: Redis RDB capture failed — non-fatal (Postgres is the source of truth)"
+        fi
+    fi
+
+    # Encryption material. WITHOUT this the Postgres dump is unreadable.
+    if [ -r "$INFISICAL_ENV_FILE" ]; then
+        cp "$INFISICAL_ENV_FILE" "$WORK/infisical/infisical-stack.env"
+        chmod 600 "$WORK/infisical/infisical-stack.env"
+        INFISICAL_ENV_PRESENT=1
+        log "  captured Infisical encryption material (ENCRYPTION_KEY + DB/Redis creds)"
+    elif [ "$INFISICAL_DB_SIZE" -gt 0 ]; then
+        # The dump exists but cannot be decrypted. Failing loudly is the whole
+        # point: a "successful" archive whose secrets are unreadable is worse
+        # than a failed backup, because the operator believes they have a
+        # safety net they do not have.
+        fail "Infisical dump captured but $INFISICAL_ENV_FILE is missing — the archive could NOT be decrypted on restore. Fix the env file and re-run."
+    else
+        log "  WARN: $INFISICAL_ENV_FILE not readable and no dump taken — nothing to capture"
+    fi
+else
+    log "WARN: infisical-postgres container not running; skipping Infisical"
+fi
+
+# ===== 8. Manifest =====
 EXPORTED="$EXPORTED" \
 PROV_COUNT="$PROV_COUNT" \
 HERMES_SIZE="$HERMES_SIZE" \
 INVENTORY_SIZE="$INVENTORY_SIZE" \
 KB_SIZE="$KB_SIZE" \
+INFISICAL_DB_SIZE="$INFISICAL_DB_SIZE" \
+INFISICAL_REDIS_SIZE="$INFISICAL_REDIS_SIZE" \
+INFISICAL_ENV_PRESENT="$INFISICAL_ENV_PRESENT" \
+INFISICAL_SECRET_COUNT="$INFISICAL_SECRET_COUNT" \
 ADMINLM_DIR="$ADMINLM_DIR" \
 GRAFANA_URL="$GRAFANA_URL" \
 python3 - <<'PY' > "$WORK/MANIFEST.json"
 import datetime, json, os
 print(json.dumps({
-    "schema_version": 2,
+    "schema_version": 3,
     "generated_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     "adminlm_dir": os.environ.get("ADMINLM_DIR", "unknown"),
     "grafana_url": os.environ.get("GRAFANA_URL", "unknown"),
@@ -210,14 +355,18 @@ print(json.dumps({
     "hermes_zip_size_bytes": int(os.environ.get("HERMES_SIZE", "0")),
     "inventory_db_size_bytes": int(os.environ.get("INVENTORY_SIZE", "0")),
     "kb_db_size_bytes": int(os.environ.get("KB_SIZE", "0")),
+    "infisical_db_size_bytes": int(os.environ.get("INFISICAL_DB_SIZE", "0")),
+    "infisical_redis_size_bytes": int(os.environ.get("INFISICAL_REDIS_SIZE", "0")),
+    "infisical_env_present": int(os.environ.get("INFISICAL_ENV_PRESENT", "0")),
+    "infisical_secret_count": int(os.environ.get("INFISICAL_SECRET_COUNT", "0")),
 }, indent=2))
 PY
 
-# ===== 8. Tar =====
+# ===== 9. Tar =====
 tar -czf "$ARCHIVE" -C "$WORK" .
 log "Wrote $ARCHIVE ($(du -h "$ARCHIVE" | awk '{print $1}'))"
 
-# ===== 9. Rotate =====
+# ===== 10. Rotate =====
 ROTATED=$(ls -1t "$BACKUP_DIR"/adminlm-backup-*.tar.gz 2>/dev/null | tail -n +$((KEEP + 1)) | wc -l)
 ls -1t "$BACKUP_DIR"/adminlm-backup-*.tar.gz 2>/dev/null | tail -n +$((KEEP + 1)) | xargs -r rm -f --
 log "Retention: kept last $KEEP backups (rotated $ROTATED old)"

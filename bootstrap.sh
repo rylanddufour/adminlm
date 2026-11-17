@@ -1628,10 +1628,20 @@ install_backup_scripts() {
         local name
         name=$(basename "$src")
         local dest="$dest_dir/$name"
-        if [ -f "$dest" ]; then
-            log_info "  $name already installed; skipping (delete to force reinstall)"
+        # Update in place when the repo copy differs. Skipping an existing
+        # file meant a FIXED script never reached an already-provisioned
+        # install — the backup cron kept running the stale copy forever, and
+        # the operator had no way to tell. These are managed artifacts
+        # (copied from the repo, which is the source of truth), so the repo
+        # copy wins. The previous version is kept alongside as .bak.<ts>.
+        if [ -f "$dest" ] && cmp -s "$src" "$dest"; then
+            log_info "  $name already installed and current; skipping"
             skipped=$((skipped + 1))
             continue
+        fi
+        if [ -f "$dest" ]; then
+            cp "$dest" "$dest.bak.$(date +%Y%m%d-%H%M%S)"
+            log_info "  $name differs from the repo copy — updating (previous version saved as .bak.<ts>)"
         fi
         cp "$src" "$dest"
         chmod 0755 "$dest"
