@@ -500,21 +500,21 @@ install_hermes() {
     # of this bootstrap session. The docs-site installer ships Node at
     # $HERMES_HOME/node/bin/ (managed by `hermes pm install node`, which
     # picks the right major version per Hermes release — verified .220 with
-    # v0.23.4: pm shipped Node 26.12.1) and the hermes CLI at
-    # $HERMES_HOME/.local/bin/. Neither is on the default PATH, so without
-    # this export `hermes` is unfindable. This must run on EVERY bootstrap
+    # v0.23.4: pm shipped Node 26.12.1) and drops a hermes CLI stub at
+    # $HOME/.local/bin/. Neither is on the default PATH, so without this
+    # export `hermes` is unfindable. This must run on EVERY bootstrap
     # invocation — including re-runs where Hermes is already installed and
     # the install below is skipped — hence why it sits above the
     # idempotency check.
-    export PATH="$HERMES_HOME/node/bin:$HERMES_HOME/.local/bin:$PATH"
+    export PATH="$HERMES_HOME/node/bin:$HOME/.local/bin:$PATH"
 
     if ! grep -q 'hermes-infrastructure' ~/.bashrc 2>/dev/null; then
         echo '' >> ~/.bashrc
         echo '# Hermes Infrastructure' >> ~/.bashrc
-        echo 'export PATH="$HOME/.hermes/node/bin:$HOME/.hermes/.local/bin:$PATH"' >> ~/.bashrc
+        echo 'export PATH="$HOME/.hermes/node/bin:$HOME/.local/bin:$PATH"' >> ~/.bashrc
     fi
 
-    if [ -f "$HERMES_HOME/hermes-agent/venv/bin/hermes" ]; then
+    if [ -f "$HERMES_HOME/hermes-agent/.hermes/bin/hermes" ]; then
         log_success "Hermes is already installed"
         return 0
     fi
@@ -658,8 +658,8 @@ EOF
     log_success "API key configured for $PROVIDER"
 
     # Apply provider + model to the default profile's config.yaml
-    if [ -f "$HERMES_HOME/hermes-agent/venv/bin/hermes" ]; then
-        local hermes_bin="$HERMES_HOME/hermes-agent/venv/bin/hermes"
+    if [ -f "$HERMES_HOME/hermes-agent/.hermes/bin/hermes" ]; then
+        local hermes_bin="$HERMES_HOME/hermes-agent/.hermes/bin/hermes"
 
         log_info "Setting default profile: provider=$PROVIDER model=${MODEL:-(unchanged)}..."
 
@@ -826,7 +826,7 @@ YAML
 
 configure_skill_safety() {
     local hermes_bin
-    hermes_bin="$HERMES_HOME/hermes-agent/venv/bin/hermes"
+    hermes_bin="$HERMES_HOME/hermes-agent/.hermes/bin/hermes"
 
     if [ ! -x "$hermes_bin" ]; then
         log_warn "hermes binary not found at $hermes_bin; skipping skill safety config"
@@ -1013,7 +1013,7 @@ generate_dashboard_credentials() {
     local dashboard_password dashboard_secret credentials_log
     local hermes_bin config_path
 
-    hermes_bin="$HERMES_HOME/hermes-agent/venv/bin/hermes"
+    hermes_bin="$HERMES_HOME/hermes-agent/.hermes/bin/hermes"
     config_path="$HERMES_HOME/config.yaml"
     credentials_log="/var/log/hermes-bootstrap-credentials.log"
 
@@ -1096,7 +1096,7 @@ install_hermes_dashboard_service() {
 
     local unit_file="/etc/systemd/system/hermes-dashboard.service"
     local hermes_user="${HERMES_USER:-$USER}"
-    local hermes_bin="$HERMES_HOME/hermes-agent/venv/bin/hermes"
+    local hermes_bin="$HERMES_HOME/hermes-agent/.hermes/bin/hermes"
     local dashboard_log="$HERMES_HOME/logs/dashboard.log"
 
     # Ensure log dir exists with correct ownership before writing the unit.
@@ -1202,7 +1202,7 @@ install_hermes_gateway_service() {
         log_info "systemctl not available; skipping gateway service install"
         return 0
     fi
-    local hermes_bin="$HERMES_HOME/hermes-agent/venv/bin/hermes"
+    local hermes_bin="$HERMES_HOME/hermes-agent/.hermes/bin/hermes"
     if [ ! -x "$hermes_bin" ]; then
         log_warn "hermes CLI not found at $hermes_bin; skipping gateway service install"
         return 0
@@ -3405,7 +3405,7 @@ verify_installation() {
         errors=$((errors + 1))
     fi
 
-    if [ -f "$HERMES_HOME/hermes-agent/venv/bin/hermes" ]; then
+    if [ -f "$HERMES_HOME/hermes-agent/.hermes/bin/hermes" ]; then
         log_success "Hermes: installed"
     else
         log_error "Hermes not found"
@@ -3420,9 +3420,9 @@ verify_installation() {
 
     # LLM plumbing smoke test — confirms the API key + provider + model all
     # work end-to-end. A passing "hello!" means Hermes can talk to the LLM.
-    if command -v hermes &>/dev/null || [ -x "$HERMES_HOME/hermes-agent/venv/bin/hermes" ]; then
+    if command -v hermes &>/dev/null || [ -x "$HERMES_HOME/hermes-agent/.hermes/bin/hermes" ]; then
         log_info "LLM smoke test (hermes chat -q \"hello!\")..."
-        local hermes_bin="$HERMES_HOME/hermes-agent/venv/bin/hermes"
+        local hermes_bin="$HERMES_HOME/hermes-agent/.hermes/bin/hermes"
         [ ! -x "$hermes_bin" ] && hermes_bin="$(command -v hermes)"
         local hello_response
         hello_response=$(timeout 30 "$hermes_bin" chat -q "hello!" 2>&1 | head -c 200 || true)
