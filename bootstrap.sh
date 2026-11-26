@@ -1237,40 +1237,52 @@ install_hermes_gateway_service() {
     # recognized" warning but still writes the value and the gateway-install
     # path reads it correctly (verified on .220: unit came up as
     # `Type=notify + WatchdogSec=120s + NotifyAccess=main`).
-    sudo -n "$hermes_bin" config set gateway.startup_watchdog_timeout_seconds 120 >/dev/null 2>&1 || \
-        sudo -n "$hermes_bin" config set gateway.systemd_watchdog_seconds 120 >/dev/null 2>&1 || \
+    #
+    # Do NOT use sudo for config set — the hermes binary refuses to run as
+    # root against a non-root-owned checkout (uid 0 vs uid 1001). The config
+    # file lives at ~/.hermes/config.yaml and is owned by $USER, so no sudo
+    # needed.
+    "$hermes_bin" config set gateway.startup_watchdog_timeout_seconds 120 >/dev/null 2>&1 || \
+        "$hermes_bin" config set gateway.systemd_watchdog_seconds 120 >/dev/null 2>&1 || \
         log_warn "Could not set startup_watchdog_timeout_seconds=120; unit may stay Type=simple"
 
     if [ ! -f /etc/systemd/system/hermes-gateway.service ]; then
         log_info "Installing hermes-gateway as a system service (user=$hermes_user)..."
-        local run_as_flag=()
-        if [ "$hermes_user" = "root" ]; then
-            run_as_flag=(--run-as-user root)
-        else
-            run_as_flag=(--run-as-user "$hermes_user")
-        fi
-        if ! sudo "$hermes_bin" gateway install --system "${run_as_flag[@]}" >/dev/null 2>&1; then
-            log_warn "hermes gateway install --system failed; cron jobs will not run automatically"
-            log_warn "Retry manually: sudo -E $hermes_bin gateway install --system --run-as-user $hermes_user"
-            return 0
-        fi
+        # Write the unit manually instead of `hermes gateway install --system`.
+        # The hermes CLI refuses to run as root when the checkout is owned
+        # by a non-root user (uid 0 vs uid 1001), which makes `sudo hermes
+        # gateway install --system` fail silently. Writing the unit directly
+        # via sudo tee is the same pattern install_hermes_dashboard_service
+        # uses and avoids the ownership check entirely.
+        local gateway_unit="/etc/systemd/system/hermes-gateway.service"
+        local hermes_home_path="$HERMES_HOME"
+        sudo tee "$gateway_unit" > /dev/null <<EOF
+[Unit]
+Description=Hermes Agent Gateway - Messaging Platform Integration
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=$hermes_user
+WorkingDirectory=$hermes_home_path/hermes-agent
+ExecStart=$hermes_bin gateway run --external-supervisor
+Restart=always
+RestartSec=5
+Environment="HERMES_HOME=$hermes_home_path"
+Environment="PATH=$hermes_home_path/node/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        sudo systemctl daemon-reload
+        sudo systemctl enable hermes-gateway.service > /dev/null 2>&1 || true
         log_success "Installed systemd unit: hermes-gateway.service (system, user=$hermes_user)"
     else
         log_info "hermes-gateway.service already installed; skipping (use --force to refresh)"
-        # Re-emit the unit if it pre-dates the watchdog config (Type=notify
-        # only). --force overwrites the existing unit; harmless on re-runs
-        # (same content for Type=simple units that were already notify).
-        if sudo grep -q '^Type=simple' /etc/systemd/system/hermes-gateway.service 2>/dev/null; then
-            log_info "  Refreshing unit to Type=notify (watchdog enabled)..."
-            local run_as_flag=()
-            if [ "$hermes_user" = "root" ]; then
-                run_as_flag=(--run-as-user root)
-            else
-                run_as_flag=(--run-as-user "$hermes_user")
-            fi
-            sudo "$hermes_bin" gateway install --system --force "${run_as_flag[@]}" >/dev/null 2>&1 || \
-                log_warn "  Unit refresh failed; existing Type=simple unit kept"
-        fi
     fi
 
     # Start the service. Idempotent: `systemctl start` on an already-
