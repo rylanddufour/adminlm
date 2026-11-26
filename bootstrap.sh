@@ -1151,8 +1151,7 @@ start_hermes_dashboard() {
         log_info "Starting via nohup (systemd not available)"
         mkdir -p "$HERMES_HOME/logs"
         (cd "$HERMES_HOME/hermes-agent" && \
-            source venv/bin/activate && \
-            nohup hermes dashboard --port "$HERMES_PORT" --host 0.0.0.0 --skip-build \
+            nohup "$HERMES_HOME/hermes-agent/.hermes/bin/hermes" dashboard --port "$HERMES_PORT" --host 0.0.0.0 --skip-build \
                 > "$HERMES_HOME/logs/dashboard.log" 2>&1 &)
     fi
 
